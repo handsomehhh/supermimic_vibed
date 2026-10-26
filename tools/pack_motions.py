@@ -141,7 +141,7 @@ def main():
         "q": np.concatenate([c[3] for c in clips]), "sources": args.csv_dir + args.npz_root, "filter": args.filter,
     }  # fmt: skip
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    torch.save(pack, args.out)
+    torch.save(pack, args.out, pickle_protocol=4)  # packs exceed 4 GiB
     print(f"loaded {n_load}, kept {len(clips)} clips, {lens.sum()} frames = {lens.sum() / FPS / 3600:.2f} h -> {args.out}", flush=True)
 
 
