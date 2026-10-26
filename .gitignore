@@ -3,9 +3,7 @@
 __pycache__/
 *.pyc
 build_*.log
-# upstream checkout (pinned commit cloned by tools/setup.sh)
-IsaacLab/
-# third-party data (downloaded by tools/download_data.sh) and generated assets
+# third-party data (downloaded by tools/download_data.sh), generated assets and motion packs
 data/
 # training runs: checkpoints, logs
 logs/
