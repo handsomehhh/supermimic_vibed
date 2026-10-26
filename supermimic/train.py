@@ -9,6 +9,7 @@ Multi-GPU: ``torchrun --nproc_per_node G supermimic/train.py ...`` (data paralle
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -47,6 +48,9 @@ parser.add_argument("--loco_packs", nargs="*", default=[], help="velocity-interf
 parser.add_argument("--vel_frac", type=float, default=0.5, help="share of envs and imagined rollouts on the velocity interface")
 parser.add_argument("--align_w", type=float, default=0.1)
 parser.add_argument("--pi_gn_skip", type=float, default=0.0, help="skip policy updates whose gradient norm exceeds this multiple of its running level (0: off)")
+parser.add_argument("--no_rollback", action="store_true", help="disable rollback to an in-memory snapshot when the policy update diverges")
+parser.add_argument("--rb_gn_factor", type=float, default=10.0, help="divergence: window gradient norm above this multiple of its healthy median")
+parser.add_argument("--rb_snapshot_every", type=int, default=250)
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
@@ -287,7 +291,7 @@ def discounted_objective(r, d):
     return (disc * c_t * r).sum(0), alive[-1], (c_t * r).detach().sum(0)
 
 
-gn_level = [None]
+gn_level = [None, 0]
 
 
 def policy_update():
@@ -336,10 +340,13 @@ def policy_update():
     nn.utils.clip_grad_value_(pi.parameters(), 0.1)
     skip = not bool(torch.isfinite(gn))
     if args.pi_gn_skip > 0 and not skip:
-        lg = float(torch.log(gn))
-        skip = gn_level[0] is not None and lg > gn_level[0] + math.log(args.pi_gn_skip)
-        if not skip:  # running level of log gradient norm from accepted updates
-            gn_level[0] = lg if gn_level[0] is None else 0.99 * gn_level[0] + 0.01 * lg
+        lg = float(torch.log(gn.clamp(min=1e-8)))
+        thr = None if gn_level[0] is None else gn_level[0] + math.log(args.pi_gn_skip)
+        skip = gn_level[1] >= 100 and lg > thr  # skipping starts once the level has seen 100 updates
+        # running level of the log gradient norm; a skipped update raises it only up to the threshold
+        lv = lg if thr is None or gn_level[1] < 100 else min(lg, thr)
+        gn_level[0] = lv if gn_level[0] is None else 0.99 * gn_level[0] + 0.01 * lv
+        gn_level[1] += 1
     if not skip:
         opt_pi.step()
     set_requires_grad(wm, True)
@@ -415,7 +422,7 @@ if start_it == 0:
 COLS = ["iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm", "imag_survival",
         "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "v_loss_v", "imag_rew_v", "imag_survival_v", "align",
         "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups", "gn_enc",
-        "gn_enc_vel", "gn_dec", "pi_skip_frac"]  # fmt: skip
+        "gn_enc_vel", "gn_dec", "pi_skip_frac", "rollbacks", "pi_lr_mult"]  # fmt: skip
 if MAIN:
     new_log = not os.path.exists(os.path.join(args.log_dir, "train_log.csv"))
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
@@ -426,11 +433,50 @@ t_log = time.time()
 step_acc = 0.0
 agg = {}
 stop_file = os.path.join(args.log_dir, "STOP")
+# rollback state: in-memory snapshots of the full training state taken while training is healthy
+rb = {"count": 0, "lr_mult": 1.0, "snaps": [], "gn_hist": [], "best_sim": -math.inf, "cooldown": 0}
+if args.resume:
+    rb.update(ck.get("rollback", {}))
+
+
+def snapshot():
+    return copy.deepcopy({k: m.state_dict() for k, m in {**MODELS, **OPTS}.items()})
+
+
+def check_divergence(it: int, w_gn: float, w_sim: float):
+    """Restore the older snapshot and halve the policy lr when the gradient norm runs away or the reward collapses."""
+    if args.no_rollback or it < args.wm_only_iters + 200:
+        return
+    h = rb["gn_hist"]
+    med = sorted(h)[len(h) // 2] if h else None
+    diverged = rb["cooldown"] == 0 and len(h) >= 4 and (
+        not math.isfinite(w_gn) or w_gn > args.rb_gn_factor * med or (rb["best_sim"] > 0.3 and w_sim < 0.5 * rb["best_sim"]))
+    if diverged and rb["snaps"]:
+        for k, m in {**MODELS, **OPTS}.items():
+            m.load_state_dict(rb["snaps"][0][k])
+        rb["snaps"] = rb["snaps"][:1]
+        rb["count"] += 1
+        rb["lr_mult"] = max(rb["lr_mult"] * 0.5, 0.125)
+        rb["cooldown"] = 4
+        if MAIN:
+            print(f"[rollback] it {it}: window grad norm {w_gn:.3g} (healthy median {med:.3g}), sim reward {w_sim:.3f} "
+                  f"(best {rb['best_sim']:.3f}); restored snapshot, policy lr x{rb['lr_mult']}", flush=True)  # fmt: skip
+        return
+    if diverged:
+        return
+    rb["cooldown"] = max(rb["cooldown"] - 1, 0)
+    h.append(w_gn)
+    del h[:-40]
+    rb["best_sim"] = max(rb["best_sim"], w_sim)
+    healthy = med is None or (w_gn <= 3 * med and w_sim >= 0.7 * rb["best_sim"])
+    if it % args.rb_snapshot_every == 0 and healthy:
+        rb["snaps"] = (rb["snaps"] + [snapshot()])[-2:]
 
 
 def save_ckpt(it: int):
     ck = {**{k: m.state_dict() for k, m in {**MODELS, **OPTS}.items()}, "iteration": it, "wall_time": time.time() - t_start,
-          "sim_steps": sim_steps, "args": vars(args), "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
+          "sim_steps": sim_steps, "args": vars(args), "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+          "rollback": {k: rb[k] for k in ("count", "lr_mult", "best_sim")}}  # fmt: skip
     last = os.path.join(args.log_dir, "last.pt")
     torch.save(ck, last + ".tmp")
     os.replace(last + ".tmp", last)
@@ -444,7 +490,7 @@ for it in range(start_it, args.iterations):
     lr = lr_at(it)
     for o in OPTS.values():
         for gparam in o.param_groups:
-            gparam["lr"] = lr
+            gparam["lr"] = lr * (rb["lr_mult"] if o is opt_pi else 1.0)
     step_acc += 1.0 / args.utd
     n = int(step_acc)
     step_acc -= n
@@ -460,6 +506,13 @@ for it in range(start_it, args.iterations):
         stop = torch.tensor(float(MAIN and os.path.exists(stop_file)), device=dev)
         if WORLD > 1:
             dist.broadcast(stop, 0)
+        # divergence check on quantities identical across ranks (gradients are averaged; sim reward is all-reduced)
+        w = torch.tensor([float(sum(float(v) for v in agg.get("gn", [])) / max(len(agg.get("gn", [])), 1)),
+                          float(sum(float(v) for v in stats["r"]) / max(len(stats["r"]), 1))], device=dev)  # fmt: skip
+        if WORLD > 1:
+            dist.all_reduce(w)
+            w /= WORLD
+        check_divergence(it + 1, float(w[0]), float(w[1]))
         if MAIN:
             mean = lambda k: float(sum(float(v) for v in agg.get(k, [])) / max(len(agg.get(k, [])), 1))  # noqa: E731
             ssum = lambda k: float(sum(float(v) for v in stats[k]))  # noqa: E731
@@ -472,7 +525,7 @@ for it in range(start_it, args.iterations):
                    mean("surv"), smean("r"), ssum("ep_len") / dn, ssum("ep_ret") / dn, ssum("term") / dn, mean("v_loss_v"),
                    mean("imag_rew_v"), mean("surv_v"), mean("align"), smean("r_v"), smean("cmd_err"), ssum("ep_len_v") / dv,
                    ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr, ssum("blown"), mean("gn_enc"), mean("gn_enc_vel"),
-                   mean("gn_dec"), mean("pi_skip")]  # fmt: skip
+                   mean("gn_dec"), mean("pi_skip"), rb["count"], rb["lr_mult"]]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
             r = dict(zip(COLS, row))
