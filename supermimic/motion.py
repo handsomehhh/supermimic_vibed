@@ -20,6 +20,20 @@ CMD_WINDOW = 25  # centered window of the reference velocity command (paper App.
 BODY_CACHE_MAX_FRAMES = 20_000_000
 
 
+class _Derived:
+    """Per-frame quantity computed from the stored tables when indexed with frame ids."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __getitem__(self, f: torch.Tensor) -> torch.Tensor:
+        return self.fn(f)
+
+
+def _yaw(R: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(R[..., 1, 0], R[..., 0, 0])
+
+
 def load_packs(paths: list[str]) -> dict:
     """Concatenate packs; returns numpy arrays plus per-clip names/lengths/source index."""
     names, lens, src, root_p, root_quat, q = [], [], [], [], [], []
@@ -47,28 +61,30 @@ class MotionLib:
         self.in_loco = torch.as_tensor(in_loco, dtype=torch.bool, device=dev)
 
         self.root_p = torch.as_tensor(packs["root_p"], dtype=torch.float32, device=dev)
-        self.root_R = quat_to_mat(torch.as_tensor(packs["root_quat"], dtype=torch.float32, device=dev))
-        self.q = torch.as_tensor(packs["q"], dtype=torch.float32, device=dev)
-        # finite differences inside each clip (central, one-sided at the clip ends)
-        i = torch.arange(self.num_frames, device=dev)
-        cs, ce = self.clip_start[self.clip_id], self.clip_end[self.clip_id]
-        prv, nxt = torch.maximum(i - 1, cs), torch.minimum(i + 1, ce)
-        dt = ((nxt - prv).float() * CONTROL_DT).clamp(min=CONTROL_DT).unsqueeze(-1)
-        self.root_v = (self.root_p[nxt] - self.root_p[prv]) / dt
-        self.qd = (self.q[nxt] - self.q[prv]) / dt
-        self.root_w = so3_log(self.root_R[nxt] @ self.root_R[prv].transpose(-1, -2)) / dt
-        Rt = self.root_R.transpose(-1, -2)
-        self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
-        self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
+        self.root_quat = torch.as_tensor(packs["root_quat"], dtype=torch.float32, device=dev)
+        self.q_tab = torch.as_tensor(packs["q"], dtype=torch.float32, device=dev)
+        # derived per-frame quantities, computed on access (indexable like tensors)
+        self.root_R = _Derived(lambda f: quat_to_mat(self.root_quat[f]))
+        self.q = _Derived(lambda f: self.q_tab[f])
+        self.root_v = _Derived(lambda f: self._diff(self.root_p, f))
+        self.qd = _Derived(lambda f: self._diff(self.q_tab, f))
+        self.root_w = _Derived(self._ang_vel)
+        self.root_v_local = _Derived(lambda f: (self.root_R[f].transpose(-1, -2) @ self.root_v[f].unsqueeze(-1)).squeeze(-1))
+        self.root_w_local = _Derived(lambda f: (self.root_R[f].transpose(-1, -2) @ self.root_w[f].unsqueeze(-1)).squeeze(-1))
 
-        # reference velocity command (vx, vy in the reference heading frame, world yaw rate)
-        h = CMD_WINDOW // 2
-        lo, hi = torch.maximum(i - h, cs), torch.minimum(i + h, ce)
-        cum = torch.cat((torch.zeros(1, 3, device=dev), torch.cumsum(torch.cat((self.root_v[:, :2], self.root_w[:, 2:]), -1).double(), 0).float()))
-        mean = (cum[hi + 1] - cum[lo]) / (hi - lo + 1).float().unsqueeze(-1)
-        Hm = yaw_mat(self.root_R)
-        vh = (Hm.transpose(-1, -2) @ torch.cat((mean[:, :2], torch.zeros_like(mean[:, :1])), -1).unsqueeze(-1)).squeeze(-1)
-        self.ref_cmd = torch.cat((vh[:, :2], mean[:, 2:]), -1)
+        # reference velocity command: mean root velocity over a centered window (vx, vy in the reference
+        # heading frame, world yaw rate from the heading change)
+        cmd = []
+        for s in range(0, self.num_frames, 1 << 22):
+            f = torch.arange(s, min(s + (1 << 22), self.num_frames), device=dev)
+            cs, ce = self.clip_start[self.clip_id[f]], self.clip_end[self.clip_id[f]]
+            lo, hi = torch.maximum(f - CMD_WINDOW // 2, cs), torch.minimum(f + CMD_WINDOW // 2, ce)
+            T = ((hi - lo).float() * CONTROL_DT).clamp(min=CONTROL_DT).unsqueeze(-1)
+            v = torch.cat(((self.root_p[hi] - self.root_p[lo])[:, :2], torch.zeros_like(T)), -1) / T
+            vh = (yaw_mat(self.root_R[f]).transpose(-1, -2) @ v.unsqueeze(-1)).squeeze(-1)
+            dyaw = torch.remainder(_yaw(self.root_R[hi]) - _yaw(self.root_R[lo]) + torch.pi, 2 * torch.pi) - torch.pi
+            cmd.append(torch.cat((vh[:, :2], dyaw.unsqueeze(-1) / T), -1))
+        self.ref_cmd = torch.cat(cmd)
 
         self.cached_bodies = self.num_frames <= BODY_CACHE_MAX_FRAMES
         if self.cached_bodies:
@@ -86,7 +102,7 @@ class MotionLib:
         first_bin = torch.cat((torch.zeros(1, dtype=torch.long), torch.cumsum(nb, 0)[:-1])).to(dev)
         local = torch.arange(self.num_bins, device=dev) - first_bin[self.bin_clip]
         self.bin_start = self.clip_start[self.bin_clip] + local * BIN_FRAMES
-        self.frame_bin = first_bin[self.clip_id] + (i - cs) // BIN_FRAMES
+        self.first_bin = first_bin
         self.bin_motion = self.in_motion[self.bin_clip]
         self.bin_loco = self.in_loco[self.bin_clip]
 
@@ -99,6 +115,24 @@ class MotionLib:
         in_motion = np.isin(src, [paths.index(p) for p in motion_packs])
         in_loco = np.isin(src, [paths.index(p) for p in loco_packs])
         return MotionLib(packs, kin, device, in_motion, in_loco)
+
+    def _nbr(self, f: torch.Tensor):
+        """Neighbors for finite differences inside the clip (central, one-sided at the clip ends)."""
+        c = self.clip_id[f]
+        prv, nxt = torch.maximum(f - 1, self.clip_start[c]), torch.minimum(f + 1, self.clip_end[c])
+        return prv, nxt, ((nxt - prv).float() * CONTROL_DT).clamp(min=CONTROL_DT).unsqueeze(-1)
+
+    def _diff(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        prv, nxt, dt = self._nbr(f)
+        return (x[nxt] - x[prv]) / dt
+
+    def _ang_vel(self, f: torch.Tensor) -> torch.Tensor:
+        prv, nxt, dt = self._nbr(f)
+        return so3_log(self.root_R[nxt] @ self.root_R[prv].transpose(-1, -2)) / dt
+
+    def frame_bin(self, f: torch.Tensor) -> torch.Tensor:
+        c = self.clip_id[f]
+        return self.first_bin[c] + (f - self.clip_start[c]) // BIN_FRAMES
 
     def _fk(self, f: torch.Tensor):
         return self.kin.forward(self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f])

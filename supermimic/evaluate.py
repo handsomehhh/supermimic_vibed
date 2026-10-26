@@ -67,7 +67,7 @@ def subset(mask: torch.Tensor, n: int) -> torch.Tensor:
 
 
 mo_ids = subset(motion.in_motion, args.max_clips)
-lo_ids = subset(motion.in_loco & motion.in_motion, args.max_loco_clips) if VEL else torch.zeros(0, dtype=torch.long)
+lo_ids = subset(motion.in_loco, args.max_loco_clips) if VEL else torch.zeros(0, dtype=torch.long)
 clip_ids = torch.cat((mo_ids, lo_ids)).to(dev)
 n_mo = len(mo_ids)
 env_m = TrackingSim(len(clip_ids), motion, mdp, dev, eval_mode=True)

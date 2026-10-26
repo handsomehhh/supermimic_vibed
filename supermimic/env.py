@@ -171,7 +171,7 @@ class TrackingSim:
                 if len(idx):
                     frames[idx], bins[idx] = self.sample_frames(len(idx), flag)
         else:
-            bins = self.motion.frame_bin[frames]
+            bins = self.motion.frame_bin(frames)
         p, R, v, w, q, qd = (x.clone() for x in self.motion.ref_state(frames))
         if self.reset_noise:
             p = p + torch.stack(
@@ -201,7 +201,7 @@ class TrackingSim:
         zero = torch.zeros(n, 3, device=dev)
         q = self.default_q.expand(n, 29)
         self.write_state(env_ids, p, R, zero, zero, q, torch.zeros(n, 29, device=dev))
-        self._reset_bookkeeping(env_ids, frames, self.motion.frame_bin[frames])
+        self._reset_bookkeeping(env_ids, frames, self.motion.frame_bin(frames))
 
     def _reset_bookkeeping(self, env_ids, frames, bins):
         self.f[env_ids] = frames
