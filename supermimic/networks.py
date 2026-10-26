@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.func import functional_call
 
 from .mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
 from .rotations import so3_exp, yaw_mat
@@ -135,12 +136,18 @@ class WorldModel(nn.Module):
 
 
 class Policy(nn.Module):
-    """a = dec(enc(g), o_{t-9:t}); deterministic, latent z in R^32 bounded by tanh."""
+    """Per-interface goal encoders and a shared decoder (paper Eq. A.1): a = dec(enc_i(g), o_{t-9:t}).
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32):
+    ``enc``: motion encoder on K future reference frames (+ reference-relative root orientation);
+    ``enc_vel``: velocity encoder on the normalized command and the observation history. The latent
+    z in R^32 is bounded by tanh; the policy is deterministic.
+    """
+
+    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, cmd_dim: int = 3):
         super().__init__()
         self.hist = hist
         self.enc = mlp(goal_dim, [2048, 1024, 512, 256], z_dim)
+        self.enc_vel = mlp(cmd_dim + obs_dim * hist, [256, 256], z_dim)
         self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], NUM_J)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
@@ -148,11 +155,27 @@ class Policy(nn.Module):
         self.obs_norm = RunningNorm(obs_dim)
         self.goal_norm = RunningNorm(goal_dim)
 
-    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        """obs_hist: (B, hist, obs_dim) noisy observations, newest last."""
-        z = torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
+    def z_motion(self, goal: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
+
+    def z_vel(self, obs_hist: torch.Tensor, cmd_n: torch.Tensor) -> torch.Tensor:
         o = self.obs_norm(obs_hist).flatten(-2)
-        return run_mlp(self.dec, torch.cat((z, o), -1))
+        return torch.tanh(run_mlp(self.enc_vel, torch.cat((cmd_n, o), -1)))
+
+    def decode(self, z: torch.Tensor, obs_hist: torch.Tensor, frozen: bool = False) -> torch.Tensor:
+        """frozen: stop-gradient on the decoder weights (gradients still reach z)."""
+        x = torch.cat((z, self.obs_norm(obs_hist).flatten(-2)), -1)
+        if not frozen:
+            return run_mlp(self.dec, x)
+        params = {k: v.detach() for k, v in self.dec.named_parameters()}
+        return run_mlp(lambda y: functional_call(self.dec, params, (y,)), x)
+
+    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        """Motion-tracking policy. obs_hist: (B, hist, obs_dim) noisy observations, newest last."""
+        return self.decode(self.z_motion(goal), obs_hist)
+
+    def act_vel(self, obs_hist: torch.Tensor, cmd_n: torch.Tensor) -> torch.Tensor:
+        return self.decode(self.z_vel(obs_hist, cmd_n), obs_hist)
 
 
 class Critic(nn.Module):

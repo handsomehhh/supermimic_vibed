@@ -16,6 +16,8 @@ FIELDS = {
     "f": ((), torch.long),
     "ep_step": ((), torch.int32),
     "done": ((), torch.bool),
+    "cmd": (3, torch.float32),
+    "cmd_ref": ((), torch.bool),
 }
 
 
@@ -52,10 +54,10 @@ class ReplayBuffer:
         out["mask"] = mask
         return out
 
-    def sample_starts(self, B: int, hist: int):
-        """Start points for imagination plus the indices of their observation history (oldest first)."""
+    def sample_starts(self, B: int, hist: int, env_lo: int = 0, env_hi: int | None = None):
+        """Start points for imagination (from envs [env_lo, env_hi)) plus their observation history (oldest first)."""
         age = torch.randint(0, self.size, (B,), device=self.device)
-        env = torch.randint(0, self.N, (B,), device=self.device)
+        env = torch.randint(env_lo, self.N if env_hi is None else env_hi, (B,), device=self.device)
         row = self._row(age)
         ep_step = self.data["ep_step"][row, env].long()
         back = torch.arange(hist - 1, -1, -1, device=self.device)  # hist-1 ... 0
@@ -63,6 +65,6 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # stay inside the buffer
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f")}
+        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "cmd", "cmd_ref")}
         hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f")}
         return start, hist_d
