@@ -4,9 +4,12 @@ Unitree SDK order, all at 50 Hz.
 Sources:
   --csv_dir DIR    LAFAN1 G1 retarget CSVs (30 fps; root pos, root quat xyzw, 29 joints in SDK order)
   --npz_root DIR   BeyondMimic-style npz (fps, joint_pos/body_* in Isaac Lab breadth-first order), recursive
+  --in_pack FILE   an existing pack (to re-filter it without reading the sources again)
 Filters:
   --filter loco    walking/jogging/running clips by name (default scheme) and an upright check
   --glob PATTERN   only file names matching PATTERN (fnmatch, e.g. 'walk*')
+  --plausible      drop clips with physically implausible velocities (root jumps, joint flips):
+                   root speed > 10 m/s, root angular velocity > 20 rad/s or joint velocity > 30 rad/s
 
   python tools/pack_motions.py --csv_dir data/lafan1_g1_loco --out data/packs/lafan_loco.pt
   python tools/pack_motions.py --npz_root .../sonic_filtered --filter loco --out data/packs/sonic_loco.pt
@@ -109,11 +112,22 @@ def upright(p: np.ndarray, quat: np.ndarray) -> bool:
     return bool(p[:, 2].min() > 0.55 and r22.min() > 0.7)
 
 
+def plausible(p: np.ndarray, quat: np.ndarray, q: np.ndarray) -> bool:
+    dt = 1.0 / FPS
+    v = np.linalg.norm(np.diff(p, axis=0), axis=-1) / dt
+    dot = np.clip(np.abs((quat[1:] * quat[:-1]).sum(-1)), 0, 1)
+    w = 2 * np.arccos(dot) / dt
+    qd = np.abs(np.diff(q, axis=0)).max(-1) / dt
+    return bool(v.max() <= 10.0 and w.max() <= 20.0 and qd.max() <= 30.0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv_dir", action="append", default=[])
     ap.add_argument("--npz_root", action="append", default=[])
     ap.add_argument("--filter", choices=["none", "loco"], default="none")
+    ap.add_argument("--in_pack", action="append", default=[])
+    ap.add_argument("--plausible", action="store_true")
     ap.add_argument("--glob", default="*")
     ap.add_argument("--workers", type=int, default=64)
     ap.add_argument("--out", required=True)
@@ -131,14 +145,22 @@ def main():
     print(f"{len(files)} files", flush=True)
     with mp.Pool(args.workers) as pool:
         clips = [c for c in pool.imap(load, files, chunksize=16) if c is not None]
+    for path in args.in_pack:
+        d = torch.load(path, weights_only=False)
+        ends = np.cumsum(d["lengths"])
+        for n, a, b in zip(d["names"], ends - d["lengths"], ends):
+            clips.append((n, d["root_p"][a:b], d["root_quat"][a:b], d["q"][a:b]))
     n_load = len(clips)
     if args.filter == "loco":
         clips = [c for c in clips if upright(c[1], c[2])]
+    if args.plausible:
+        clips = [c for c in clips if plausible(c[1], c[2], c[3])]
     lens = np.array([len(c[1]) for c in clips], dtype=np.int64)
     pack = {
         "names": [c[0] for c in clips], "lengths": lens,
         "root_p": np.concatenate([c[1] for c in clips]), "root_quat": np.concatenate([c[2] for c in clips]),
-        "q": np.concatenate([c[3] for c in clips]), "sources": args.csv_dir + args.npz_root, "filter": args.filter,
+        "q": np.concatenate([c[3] for c in clips]), "sources": args.csv_dir + args.npz_root + args.in_pack,
+        "filter": args.filter + ("+plausible" if args.plausible else ""),
     }  # fmt: skip
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(pack, args.out, pickle_protocol=4)  # packs exceed 4 GiB
