@@ -47,6 +47,8 @@ CRITERIA = {  # best evaluation must satisfy all
     "exp3": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
 }
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
+# stabilizers for the BPTT policy update (in-trainer rollback is on by default)
+TRAIN_ARGS = ["--pi_gn_skip", "5"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01}
 
 status = json.load(open(STATUS)) if os.path.exists(STATUS) else {}
@@ -119,7 +121,7 @@ def run(name: str, motion_packs: list[str], loco_packs: list[str]) -> dict:
         return st
     resume = os.path.join(log_dir, "last.pt")
     cmd = [PY, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={NGPU}", "supermimic/train.py", "--log_dir", log_dir,
-           "--motion_packs", *motion_packs, "--loco_packs", *loco_packs, "--iterations", str(STOP_RULES["max_iters"])]  # fmt: skip
+           "--motion_packs", *motion_packs, "--loco_packs", *loco_packs, "--iterations", str(STOP_RULES["max_iters"]), *TRAIN_ARGS]  # fmt: skip
     if os.path.exists(resume):
         cmd += ["--resume", resume]
     if os.path.exists(os.path.join(log_dir, "STOP")):
