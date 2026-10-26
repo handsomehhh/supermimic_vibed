@@ -46,6 +46,7 @@ parser.add_argument("--motion_packs", nargs="+", required=True)
 parser.add_argument("--loco_packs", nargs="*", default=[], help="velocity-interface library; empty: motion tracking only")
 parser.add_argument("--vel_frac", type=float, default=0.5, help="share of envs and imagined rollouts on the velocity interface")
 parser.add_argument("--align_w", type=float, default=0.1)
+parser.add_argument("--pi_gn_skip", type=float, default=0.0, help="skip policy updates whose gradient norm exceeds this multiple of its running level (0: off)")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
@@ -286,6 +287,9 @@ def discounted_objective(r, d):
     return (disc * c_t * r).sum(0), alive[-1], (c_t * r).detach().sum(0)
 
 
+gn_level = [None]
+
+
 def policy_update():
     sm, hm = sample_valid_starts(BM, 0, N_MO)
     sv, hv = sample_valid_starts(BV, N_MO, args.num_envs) if VEL else ([], [])
@@ -326,9 +330,17 @@ def policy_update():
     opt_pi.zero_grad(set_to_none=True)
     loss.backward()
     allreduce_grads(pi.parameters())
+    gparts = {k: torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in getattr(pi, k).parameters() if p.grad is not None] or [torch.zeros((), device=dev)]))
+              for k in ("enc", "enc_vel", "dec")}  # fmt: skip
     gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
     nn.utils.clip_grad_value_(pi.parameters(), 0.1)
-    if torch.isfinite(gn):
+    skip = not bool(torch.isfinite(gn))
+    if args.pi_gn_skip > 0 and not skip:
+        lg = float(torch.log(gn))
+        skip = gn_level[0] is not None and lg > gn_level[0] + math.log(args.pi_gn_skip)
+        if not skip:  # running level of log gradient norm from accepted updates
+            gn_level[0] = lg if gn_level[0] is None else 0.99 * gn_level[0] + 0.01 * lg
+    if not skip:
         opt_pi.step()
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
@@ -350,7 +362,8 @@ def policy_update():
             X = vel_critic_input_c(S_c, cmd_c, xi_c).view(HZ + 1, BV, -1)
             targets = gae_targets(critic_v(X), rv.detach(), dv.detach())
         out["v_loss_v"] = fit_critic(critic_v, opt_vv, X, targets)
-    out.update(pi=loss.detach(), gn=gn.detach())
+    out.update(pi=loss.detach(), gn=gn.detach(), gn_enc=gparts["enc"], gn_enc_vel=gparts["enc_vel"], gn_dec=gparts["dec"],
+               pi_skip=torch.tensor(float(skip), device=dev))  # fmt: skip
     return out
 
 
@@ -401,7 +414,8 @@ if start_it == 0:
     collect(args.warmup_steps, stats)
 COLS = ["iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm", "imag_survival",
         "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "v_loss_v", "imag_rew_v", "imag_survival_v", "align",
-        "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups"]  # fmt: skip
+        "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups", "gn_enc",
+        "gn_enc_vel", "gn_dec", "pi_skip_frac"]  # fmt: skip
 if MAIN:
     new_log = not os.path.exists(os.path.join(args.log_dir, "train_log.csv"))
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
@@ -457,7 +471,8 @@ for it in range(start_it, args.iterations):
             row = [it + 1, wall_h, sim_steps, mean("wm"), mean("wm8"), mean("pi"), mean("v_loss"), mean("imag_rew"), mean("gn"),
                    mean("surv"), smean("r"), ssum("ep_len") / dn, ssum("ep_ret") / dn, ssum("term") / dn, mean("v_loss_v"),
                    mean("imag_rew_v"), mean("surv_v"), mean("align"), smean("r_v"), smean("cmd_err"), ssum("ep_len_v") / dv,
-                   ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr, ssum("blown")]  # fmt: skip
+                   ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr, ssum("blown"), mean("gn_enc"), mean("gn_enc_vel"),
+                   mean("gn_dec"), mean("pi_skip")]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
             r = dict(zip(COLS, row))
