@@ -53,9 +53,10 @@ class TrackingSim:
     """Batched G1 simulator. Call :func:`use_warp_stream` before constructing it."""
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99, eval_mode: bool = False,
-                 max_episode_steps: int = 500, reset_noise: bool = True, n_vel: int = 0, substeps: int = 4):  # fmt: skip
+                 max_episode_steps: int = 500, reset_noise: bool = True, n_vel: int = 0, substeps: int = 4, reset_temp: float = 25.0):  # fmt: skip
         self.device = dev = device
         self.N, self.n_vel = num_envs, n_vel
+        self.reset_temp = reset_temp  # softmax temperature of return-based reset sampling (paper: 25)
         self.motion, self.mdp, self.gamma = motion, mdp, gamma
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
@@ -142,7 +143,7 @@ class TrackingSim:
         if vel:
             probs = m.bin_loco.float()
         else:
-            soft = torch.softmax(torch.where(m.bin_motion, -25.0 * self.bin_G / self.G_max, -torch.inf), 0)
+            soft = torch.softmax(torch.where(m.bin_motion, -self.reset_temp * self.bin_G / self.G_max, -torch.inf), 0)
             self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
             probs = 0.5 * m.bin_motion.float() / m.bin_motion.sum() + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
         bins = torch.multinomial(probs, n, replacement=True)

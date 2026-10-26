@@ -47,6 +47,7 @@ parser.add_argument("--motion_packs", nargs="+", required=True)
 parser.add_argument("--loco_packs", nargs="*", default=[], help="velocity-interface library; empty: motion tracking only")
 parser.add_argument("--vel_frac", type=float, default=0.5, help="share of envs and imagined rollouts on the velocity interface")
 parser.add_argument("--align_w", type=float, default=0.1)
+parser.add_argument("--reset_temp", type=float, default=25.0, help="softmax temperature of return-based reset sampling (0: uniform part only)")
 parser.add_argument("--pi_gn_skip", type=float, default=0.0, help="skip policy updates whose gradient norm exceeds this multiple of its running level (0: off)")
 parser.add_argument("--no_rollback", action="store_true", help="disable rollback to an in-memory snapshot when the policy update diverges")
 parser.add_argument("--rb_gn_factor", type=float, default=10.0, help="divergence: window gradient norm above this multiple of its healthy median")
@@ -375,7 +376,7 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL)
+env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp)
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 is_vel = env.is_vel

@@ -9,7 +9,7 @@ Filters:
   --filter loco    walking/jogging/running clips by name (default scheme) and an upright check
   --glob PATTERN   only file names matching PATTERN (fnmatch, e.g. 'walk*')
   --plausible      drop clips with physically implausible velocities (root jumps, joint flips):
-                   root speed > 10 m/s, root angular velocity > 20 rad/s or joint velocity > 30 rad/s
+                   by default root speed > 10 m/s, root angular velocity > 20 rad/s or joint velocity > 30 rad/s
 
   python tools/pack_motions.py --csv_dir data/lafan1_g1_loco --out data/packs/lafan_loco.pt
   python tools/pack_motions.py --npz_root .../sonic_filtered --filter loco --out data/packs/sonic_loco.pt
@@ -112,13 +112,13 @@ def upright(p: np.ndarray, quat: np.ndarray) -> bool:
     return bool(p[:, 2].min() > 0.55 and r22.min() > 0.7)
 
 
-def plausible(p: np.ndarray, quat: np.ndarray, q: np.ndarray) -> bool:
+def plausible(p: np.ndarray, quat: np.ndarray, q: np.ndarray, limits=(10.0, 20.0, 30.0)) -> bool:
     dt = 1.0 / FPS
     v = np.linalg.norm(np.diff(p, axis=0), axis=-1) / dt
     dot = np.clip(np.abs((quat[1:] * quat[:-1]).sum(-1)), 0, 1)
     w = 2 * np.arccos(dot) / dt
     qd = np.abs(np.diff(q, axis=0)).max(-1) / dt
-    return bool(v.max() <= 10.0 and w.max() <= 20.0 and qd.max() <= 30.0)
+    return bool(v.max() <= limits[0] and w.max() <= limits[1] and qd.max() <= limits[2])
 
 
 def main():
@@ -128,6 +128,7 @@ def main():
     ap.add_argument("--filter", choices=["none", "loco"], default="none")
     ap.add_argument("--in_pack", action="append", default=[])
     ap.add_argument("--plausible", action="store_true")
+    ap.add_argument("--plausible_limits", default="10,20,30", help="max root speed (m/s), root angular velocity (rad/s), joint velocity (rad/s)")
     ap.add_argument("--glob", default="*")
     ap.add_argument("--workers", type=int, default=64)
     ap.add_argument("--out", required=True)
@@ -154,7 +155,8 @@ def main():
     if args.filter == "loco":
         clips = [c for c in clips if upright(c[1], c[2])]
     if args.plausible:
-        clips = [c for c in clips if plausible(c[1], c[2], c[3])]
+        lim = tuple(float(x) for x in args.plausible_limits.split(","))
+        clips = [c for c in clips if plausible(c[1], c[2], c[3], lim)]
     lens = np.array([len(c[1]) for c in clips], dtype=np.int64)
     pack = {
         "names": [c[0] for c in clips], "lengths": lens,
