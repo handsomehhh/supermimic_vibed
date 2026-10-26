@@ -18,6 +18,7 @@ FIELDS = {
     "done": ((), torch.bool),
     "cmd": (3, torch.float32),
     "cmd_ref": ((), torch.bool),
+    "valid": ((), torch.bool),  # False for transitions in which the simulator blew up
 }
 
 
@@ -47,10 +48,11 @@ class ReplayBuffer:
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)
         rows = self._row(ages)
         e = env.unsqueeze(-1).expand_as(rows)
-        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "done")}
-        # transition j is valid if no episode ended at transitions 0..j-1
+        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "done", "valid")}
+        # transition j is used if no episode ended at transitions 0..j-1 and transitions 0..j are valid
         d = out["done"].float()
         mask = torch.cumprod(torch.cat((torch.ones(B, 1, device=self.device), 1 - d[:, :-1]), -1), -1)
+        mask = mask * torch.cumprod(out["valid"].float(), -1)
         out["mask"] = mask
         return out
 
@@ -65,6 +67,6 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # stay inside the buffer
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "cmd", "cmd_ref")}
+        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "cmd", "cmd_ref", "valid")}
         hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f")}
         return start, hist_d

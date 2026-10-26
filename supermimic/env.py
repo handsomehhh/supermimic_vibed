@@ -23,6 +23,8 @@ from .rotations import mat_to_quat, quat_to_mat, so3_exp
 CMD_LO = (-1.5, -1.32, -3.35)
 CMD_HI = (2.0, 1.32, 3.35)
 CMD_RESAMPLE_STEPS = 250
+# a world whose velocities exceed these bounds (or turn non-finite) has blown up numerically
+MAX_ROOT_VEL, MAX_JOINT_VEL = 50.0, 100.0
 
 
 def use_warp_stream(device: str):
@@ -66,7 +68,9 @@ class TrackingSim:
             self.data = mjw.make_data(mjm, nworld=num_envs, nconmax=128, njmax=600)
             friction = _expand(self.model, "geom_friction", num_envs)
             ipos = _expand(self.model, "body_ipos", num_envs)
+            self._blown = wp.zeros(num_envs, dtype=bool)
         self.qpos, self.qvel, self.ctrl = (wp.to_torch(x) for x in (self.data.qpos, self.data.qvel, self.data.ctrl))
+        self.blown = wp.to_torch(self._blown)
         self.default_q = torch.tensor(default_joint_pos_list(), device=dev)
         self.alpha = torch.tensor([action_scale(n) for n in G1_JOINT_NAMES], device=dev)
         self.is_vel = torch.arange(num_envs, device=dev) >= num_envs - n_vel
@@ -223,21 +227,30 @@ class TrackingSim:
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
         cmd, cmd_ref = self.cmd.clone(), self.cmd_ref.clone()
-        self.ctrl[:] = self.default_q + xi[:, 1:30] + self.alpha * a
+        # setpoints beyond the joint range only push the joint into its limit (and can blow up the solver)
+        self.ctrl[:] = torch.clamp(self.default_q + xi[:, 1:30] + self.alpha * a, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
+        qpos0, qvel0 = self.qpos.clone(), self.qvel.clone()
         wp.capture_launch(self.step_graph)
+        bad = ~(torch.isfinite(self.qpos).all(-1) & torch.isfinite(self.qvel).all(-1))
+        bad |= (self.qvel[:, :6].abs().amax(-1) > MAX_ROOT_VEL) | (self.qvel[:, 6:].abs().amax(-1) > MAX_JOINT_VEL)
+        # roll blown-up worlds back to their pre-step state; the transition is marked invalid and the episode ends
+        self.qpos.copy_(torch.where(bad.unsqueeze(-1), qpos0, self.qpos))
+        self.qvel.copy_(torch.where(bad.unsqueeze(-1), qvel0, self.qvel))
         S1 = self.state()
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         f1 = torch.minimum(f + 1, clip_end)
         vel = self.is_vel
         r = torch.where(vel, self.mdp.vel_reward(S1, cmd, a, a_prev), self.mdp.reward(S1, f1, a, a_prev))
-        term = torch.where(vel, self.mdp.fall(S1), self.mdp.termination(S1, f1))
+        r = torch.where(bad, 0.0, r)
+        term = torch.where(vel, self.mdp.fall(S1), self.mdp.termination(S1, f1)) | bad
         timeout = (f + 1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
         if self.eval_mode:
             timeout = timeout & ~vel  # the step test ends on its own clock
         done = term | timeout
         out = {
             "s": flatten_state(S), "a": a.clone(), "a_prev": a_prev, "f": f, "s1": flatten_state(S1), "r": r,
-            "term": term, "done": done, "ep_step": ep_step, "xi": xi, "cmd": cmd, "cmd_ref": cmd_ref,
+            "term": term, "done": done, "ep_step": ep_step, "xi": xi, "cmd": cmd, "cmd_ref": cmd_ref, "valid": ~bad,
+            "n_blown": bad.sum(),
         }  # fmt: skip
         # bookkeeping
         self.ep_disc_ret += (self.gamma ** ep_step.float()) * r
@@ -256,7 +269,7 @@ class TrackingSim:
         ids = done.nonzero(as_tuple=False).squeeze(-1)
         if len(ids) > 0:
             T = self.ep_step[ids].float()
-            mo = ids[~vel[ids]]
+            mo = ids[~vel[ids] & ~bad[ids]]
             if len(mo) > 0:
                 # bin return estimate; truncated episodes bootstrap with their mean reward
                 Tm = self.ep_step[mo].float()
@@ -267,5 +280,9 @@ class TrackingSim:
             out["done_vel"] = vel[ids]
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * torch.where(vel[ids], MAX_STEP_REWARD_VEL, MAX_STEP_REWARD))
+            if bool(bad.any()):  # clear the solver state (warm start, contacts) of blown-up worlds
+                self.blown.copy_(bad)
+                with wp.ScopedDevice(self.wp_device):
+                    mjw.reset_data(self.model, self.data, reset=self._blown)
             self.reset(ids)
         return out

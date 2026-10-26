@@ -242,7 +242,7 @@ def sample_valid_starts(B: int, env_lo: int, env_hi: int):
     while n < B:
         s, h = buffer.sample_starts(2 * B, Hh, env_lo, env_hi)
         f = s["f"]
-        ok = f + HZ <= motion.clip_end[motion.clip_id[f]]
+        ok = (f + HZ <= motion.clip_end[motion.clip_id[f]]) & s["valid"]
         idx = ok.nonzero(as_tuple=False).squeeze(-1)[: B - n]
         starts.append({k: v[idx] for k, v in s.items()}), hists.append({k: v[idx] for k, v in h.items()})
         n += len(idx)
@@ -378,14 +378,16 @@ def collect(n_steps: int, stats: dict):
         a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
         out = env.step(a)
         buffer.add(out)
-        S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-        wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
+        ok = out["valid"]
+        S0, S1 = unflatten_state(out["s"][ok]), unflatten_state(out["s1"][ok])
+        wm.in_norm.update(wm.inputs(S0, out["a"][ok], normalize_xi(out["xi"][ok])))
         wm.out_norm.update(wm.targets(S0, S1))
+        stats["blown"].append(out["n_blown"])
         sim_steps += args.num_envs * WORLD
         stats["r"].append(out["r"][:N_MO].mean() / MAX_STEP_REWARD)
         if VEL:
             stats["r_v"].append(out["r"][N_MO:].mean() / MAX_STEP_REWARD_VEL)
-            stats["cmd_err"].append((mdp.heading_vel(S1)[N_MO:] - out["cmd"][N_MO:]).norm(dim=-1).mean())
+            stats["cmd_err"].append((mdp.heading_vel(unflatten_state(out["s1"]))[N_MO:] - out["cmd"][N_MO:]).norm(dim=-1).mean())
         if "ep_len" in out:
             for key, sel in (("", ~out["done_vel"]), ("_v", out["done_vel"])):
                 ids = out["done_ids"][sel]
@@ -393,13 +395,13 @@ def collect(n_steps: int, stats: dict):
                 stats["term" + key].append(out["term"][ids].float().sum()), stats["done" + key].append(sel.float().sum())
 
 
-STAT_KEYS = ["r", "r_v", "cmd_err", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
+STAT_KEYS = ["blown", "r", "r_v", "cmd_err", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
 stats = {k: [] for k in STAT_KEYS}
 if start_it == 0:
     collect(args.warmup_steps, stats)
 COLS = ["iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm", "imag_survival",
         "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "v_loss_v", "imag_rew_v", "imag_survival_v", "align",
-        "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr"]  # fmt: skip
+        "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups"]  # fmt: skip
 if MAIN:
     new_log = not os.path.exists(os.path.join(args.log_dir, "train_log.csv"))
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
@@ -455,14 +457,14 @@ for it in range(start_it, args.iterations):
             row = [it + 1, wall_h, sim_steps, mean("wm"), mean("wm8"), mean("pi"), mean("v_loss"), mean("imag_rew"), mean("gn"),
                    mean("surv"), smean("r"), ssum("ep_len") / dn, ssum("ep_ret") / dn, ssum("term") / dn, mean("v_loss_v"),
                    mean("imag_rew_v"), mean("surv_v"), mean("align"), smean("r_v"), smean("cmd_err"), ssum("ep_len_v") / dv,
-                   ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr]  # fmt: skip
+                   ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr, ssum("blown")]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
             r = dict(zip(COLS, row))
             print(f"it {it + 1} | {wall_h:.3f} h | wm {r['wm_loss']:.4f} e8 {r['wm_err8']:.4f} | pi {r['pi_loss']:.3f} imag_r {r['imag_rew']:.3f} "
                   f"surv {r['imag_survival']:.3f} | sim_r {r['sim_rew']:.3f} ep_ret {r['ep_ret_norm']:.3f} term {r['term_frac']:.2f} | "
                   f"vel: imag_r {r['imag_rew_v']:.3f} sim_r {r['sim_rew_v']:.3f} cmd_err {r['cmd_err']:.3f} fall {r['fall_frac_v']:.2f} "
-                  f"align {r['align']:.4f} | {ips:.2f} it/s", flush=True)  # fmt: skip
+                  f"align {r['align']:.4f} | blowups {int(r['sim_blowups'])} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in STAT_KEYS}
         agg = {}
         if bool(stop):
