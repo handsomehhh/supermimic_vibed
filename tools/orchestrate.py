@@ -1,21 +1,26 @@
 """Run the three velocity-interface experiments one after another on all GPUs, with a monitor that
-stops a run once it is done, diverged, or no longer improving.
+stops each run once it is done, diverged, or no longer improving.
 
-  exp1  motion + velocity interfaces on the LAFAN1 locomotion clips (code check)
+  exp1  motion + velocity interfaces on the LAFAN1 locomotion clips (code check; one 8-GPU run)
   exp2  both interfaces on BONES-SEED (sonic_filtered) locomotion + LAFAN1 locomotion
   exp3  velocity interface on exp2's library if exp2 succeeded, else exp1's; motion interface on all of
         motion_data_used_g1
 
-Every POLL seconds the monitor reads train_log.csv / eval.csv of the running experiment and writes
-STOP (the trainer saves a checkpoint and exits) when
-  - the trainer crashed, or diverged: losses NaN/inf for 3 consecutive log rows, the simulator reward of
-    the motion envs below half of its best for 3 consecutive log rows, or the latest evaluation's motion
-    return 0.3 below its best,
+exp2 and exp3 run as one single-GPU training per GPU (seeds 0..NGPU-1, the paper's 1-GPU setting): data
+parallel training on 8 GPUs diverged on BONES-SEED at every learning rate tried, single-GPU runs did not
+(logs/diag, logs/diag2). Each run has its own evaluation watcher on its GPU.
+
+Every POLL seconds the monitor reads train_log.csv / eval.csv of each run and writes STOP (the trainer
+saves a checkpoint and exits) when
+  - the run diverged: losses NaN/inf for 3 consecutive log rows, the simulator reward of the motion envs
+    below half of its best for 3 consecutive log rows, or the latest evaluation's motion return 0.3 below
+    its best (the trainer itself rolls back to snapshots first),
   - wall time exceeds max_hours,
   - after min_iters, none of the eval metrics improved for `patience` evaluations (converged),
   - after nogo_iters, motion fail rate and velocity fall rate are both still > 0.9 (no progress).
-A run succeeds if its best evaluation meets the experiment's criteria. A crash or divergence stops the
-chain; rerunning the orchestrator resumes the unfinished experiment from its last.pt. Status: logs/orchestrator.json.
+A run succeeds if its best evaluation meets the experiment's criteria; an experiment succeeds if at least
+half of its runs do. If more than half of the runs crash, the chain stops; rerunning the orchestrator
+resumes unfinished runs from their last.pt. Status: logs/orchestrator.json.
 
   nohup python tools/orchestrate.py > logs/orchestrator.log 2>&1 &
 """
@@ -47,9 +52,8 @@ CRITERIA = {  # best evaluation must satisfy all
     "exp3": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
 }
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
-# stabilizers for the BPTT policy update (in-trainer rollback is on by default)
-# lr 2e-4 on 8 GPUs (the single-GPU value): the sqrt-scaled rates diverged on BONES-SEED (logs/diag, logs/diag2)
-TRAIN_ARGS = ["--pi_gn_skip", "5", "--lr_gpu_cap", "1"]
+# stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
+TRAIN_ARGS = ["--pi_gn_skip", "5"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01}
 
 status = json.load(open(STATUS)) if os.path.exists(STATUS) else {}
@@ -113,83 +117,129 @@ def plateaued(rows: list[dict], patience: int) -> bool:
     return True
 
 
-def run(name: str, motion_packs: list[str], loco_packs: list[str]) -> dict:
-    log_dir = os.path.join(REPO, "logs", name)
-    os.makedirs(log_dir, exist_ok=True)
+def stop_reason(tl: list[dict], ev: list[dict], hours: float) -> str | None:
+    last = ev[-1] if ev else {}
+    bad = [r for r in tl[-3:] if any(not math.isfinite(num(r[k])) for k in ("wm_loss", "pi_loss"))]
+    sim = [num(r["sim_rew"]) for r in tl if num(r["iteration"]) >= 1000]
+    nr = [num(r["norm_return"]) for r in ev]
+    if len(tl) >= 3 and len(bad) == 3:
+        return "diverged (NaN/inf losses)"
+    if len(sim) > 10 and max(sim) > 0 and all(x < 0.5 * max(sim) for x in sim[-3:]):
+        return "diverged (simulator reward collapsed)"
+    if len(nr) >= 2 and max(nr) - nr[-1] > 0.3:
+        return "diverged (evaluation return collapsed)"
+    if hours > STOP_RULES["max_hours"]:
+        return "max wall time"
+    if ev and int(num(last["iteration"])) >= STOP_RULES["min_iters"] and plateaued(ev, STOP_RULES["patience"]):
+        return "converged (no eval improvement)"
+    if ev and int(num(last["iteration"])) >= STOP_RULES["nogo_iters"] and num(last["fail_rate"]) > 0.9 and num(last.get("vel_fall_rate", 1)) > 0.9:
+        return "no progress"
+    return None
+
+
+class Run:
+    """One training process (one or all GPUs) plus its evaluation watcher."""
+
+    def __init__(self, name: str, log_dir: str, gpus: list[int], motion_packs: list[str], loco_packs: list[str], seed: int):
+        self.name, self.log_dir, self.gpus = name, log_dir, gpus
+        os.makedirs(log_dir, exist_ok=True)
+        args = ["supermimic/train.py", "--log_dir", log_dir, "--motion_packs", *motion_packs, "--loco_packs", *loco_packs,
+                "--iterations", str(STOP_RULES["max_iters"]), "--seed", str(seed), *TRAIN_ARGS]  # fmt: skip
+        if os.path.exists(os.path.join(log_dir, "last.pt")):
+            args += ["--resume", os.path.join(log_dir, "last.pt")]
+        if os.path.exists(os.path.join(log_dir, "STOP")):
+            os.remove(os.path.join(log_dir, "STOP"))
+        cmd = [PY, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={len(gpus)}", *args] if len(gpus) > 1 else [PY, *args]
+        self.env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)), "PYTHONUNBUFFERED": "1"}
+        self.train = subprocess.Popen(cmd, cwd=REPO, env=self.env, stdout=open(os.path.join(log_dir, "stdout.log"), "a"),
+                                      stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
+        self.start_eval()
+        self.t0, self.reason, self.exit_reason = time.time(), None, None
+        log(f"{name}: started train pid {self.train.pid} on GPUs {gpus}: {' '.join(cmd)}")
+
+    def start_eval(self):
+        env = {**self.env, "CUDA_VISIBLE_DEVICES": str(self.gpus[-1])}
+        self.evaler = subprocess.Popen([PY, "supermimic/evaluate.py", "--run_dir", self.log_dir, "--watch"], cwd=REPO, env=env,
+                                       stdout=open(os.path.join(self.log_dir, "eval_stdout.log"), "a"), stderr=subprocess.STDOUT,
+                                       start_new_session=True)  # fmt: skip
+
+    def poll(self) -> dict:
+        """Apply the stop rules; returns a status summary."""
+        rc = self.train.poll()
+        tl = read_csv(os.path.join(self.log_dir, "train_log.csv"))
+        ev = read_csv(os.path.join(self.log_dir, "eval.csv"))
+        if rc is None and self.evaler.poll() is not None:
+            log(f"{self.name}: eval watcher exited ({self.evaler.returncode}); restarting it")
+            self.start_eval()
+        if rc is None and self.reason is None:
+            self.reason = stop_reason(tl, ev, (time.time() - self.t0) / 3600)
+            if self.reason:
+                log(f"{self.name}: stopping at it {tl[-1]['iteration'] if tl else 0}: {self.reason}")
+                open(os.path.join(self.log_dir, "STOP"), "w").write(self.reason + "\n")
+        if rc is not None and self.exit_reason is None:
+            self.exit_reason = self.reason or ("finished" if rc == 0 else f"crashed (exit {rc})")
+        last = ev[-1] if ev else {}
+        return {"iteration": int(num(tl[-1]["iteration"])) if tl else 0, "it_per_s": num(tl[-1]["it_per_s"]) if tl else None,
+                "rollbacks": int(num(tl[-1].get("rollbacks", 0))) if tl and tl[-1].get("rollbacks") else 0, "n_evals": len(ev),
+                "last_eval": {k: last.get(k) for k in ("iteration", "norm_return", "fail_rate", "vel_med_err", "vel_fall_rate")},
+                "running": rc is None}  # fmt: skip
+
+    def finish(self, crit: dict) -> dict:
+        """Let the watcher score the final checkpoint, stop it, and judge the run."""
+        ckpts = [int(f[5:11]) for f in os.listdir(self.log_dir) if f.startswith("ckpt_") and f.endswith(".pt")]
+        final, t = max(ckpts, default=0), time.time()
+        while final and time.time() - t < 1800 and final not in [int(num(r["iteration"])) for r in read_csv(os.path.join(self.log_dir, "eval.csv"))]:
+            time.sleep(30)
+        try:
+            os.killpg(self.evaler.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        best = best_row(read_csv(os.path.join(self.log_dir, "eval.csv")), crit)
+        reason = self.exit_reason
+        if reason.startswith(("crashed", "diverged")):
+            state = reason.split(" ")[0]
+        else:
+            state = "success" if best is not None and meets(best, crit) else "failed"
+        return {"state": state, "reason": reason, "best_eval": best, "finished": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], per_gpu: bool = True) -> dict:
+    """per_gpu: one single-GPU run per GPU (seed = GPU index); else one run on all GPUs."""
     st = status.setdefault(name, {})
     if st.get("state") in ("success", "failed"):
         log(f"{name}: already {st['state']}, skipping")
         return st
-    resume = os.path.join(log_dir, "last.pt")
-    cmd = [PY, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={NGPU}", "supermimic/train.py", "--log_dir", log_dir,
-           "--motion_packs", *motion_packs, "--loco_packs", *loco_packs, "--iterations", str(STOP_RULES["max_iters"]), *TRAIN_ARGS]  # fmt: skip
-    if os.path.exists(resume):
-        cmd += ["--resume", resume]
-    if os.path.exists(os.path.join(log_dir, "STOP")):
-        os.remove(os.path.join(log_dir, "STOP"))
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, range(NGPU))), "PYTHONUNBUFFERED": "1"}
-    train = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=open(os.path.join(log_dir, "stdout.log"), "a"), stderr=subprocess.STDOUT,
-                             start_new_session=True)  # fmt: skip
-    ev_env = {**env, "CUDA_VISIBLE_DEVICES": str(NGPU - 1)}
-    evaler = subprocess.Popen([PY, "supermimic/evaluate.py", "--run_dir", log_dir, "--watch"], cwd=REPO, env=ev_env,
-                              stdout=open(os.path.join(log_dir, "eval_stdout.log"), "a"), stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
-    st.update(state="running", started=st.get("started", time.strftime("%Y-%m-%d %H:%M:%S")), motion_packs=motion_packs, loco_packs=loco_packs,
-              train_pid=train.pid, eval_pid=evaler.pid)  # fmt: skip
+    crit = CRITERIA[name]
+    specs = [(f"{name}/s{g}", [g], g) for g in range(NGPU)] if per_gpu else [(name, list(range(NGPU)), 0)]
+    runs_st = st.setdefault("runs", {})
+    runs = [Run(n, os.path.join(REPO, "logs", n), gpus, motion_packs, loco_packs, seed) for n, gpus, seed in specs
+            if runs_st.get(n, {}).get("state") not in ("success", "failed", "diverged")]  # fmt: skip
+    st.update(state="running", started=st.get("started", time.strftime("%Y-%m-%d %H:%M:%S")), motion_packs=motion_packs,
+              loco_packs=loco_packs, criteria=crit)  # fmt: skip
     save_status()
-    log(f"{name}: started train pid {train.pid}, eval pid {evaler.pid}: {' '.join(cmd)}")
-    t0 = time.time()
-    reason = None
-    while True:
+    active = list(runs)
+    while active:
         time.sleep(POLL)
-        rc = train.poll()
-        tl = read_csv(os.path.join(log_dir, "train_log.csv"))
-        ev = read_csv(os.path.join(log_dir, "eval.csv"))
-        it = int(num(tl[-1]["iteration"])) if tl else 0
-        last = ev[-1] if ev else {}
-        st.update(iteration=it, wall_h=round((time.time() - t0) / 3600, 3), n_evals=len(ev), last_eval=last,
-                  it_per_s=num(tl[-1]["it_per_s"]) if tl else None)  # fmt: skip
-        if evaler.poll() is not None and rc is None:
-            log(f"{name}: eval watcher exited ({evaler.returncode}); restarting it")
-            evaler = subprocess.Popen([PY, "supermimic/evaluate.py", "--run_dir", log_dir, "--watch"], cwd=REPO, env=ev_env,
-                                      stdout=open(os.path.join(log_dir, "eval_stdout.log"), "a"), stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
-        if rc is not None:
-            reason = reason or ("finished" if rc == 0 else f"crashed (exit {rc})")
-            break
-        if reason is None:
-            bad = [r for r in tl[-3:] if any(not math.isfinite(num(r[k])) for k in ("wm_loss", "pi_loss"))]
-            sim = [num(r["sim_rew"]) for r in tl if num(r["iteration"]) >= 1000]
-            nr = [num(r["norm_return"]) for r in ev]
-            if len(tl) >= 3 and len(bad) == 3:
-                reason = "diverged (NaN/inf losses)"
-            elif len(sim) > 10 and max(sim) > 0 and all(x < 0.5 * max(sim) for x in sim[-3:]):
-                reason = "diverged (simulator reward collapsed)"
-            elif len(nr) >= 2 and max(nr) - nr[-1] > 0.3:
-                reason = "diverged (evaluation return collapsed)"
-            elif (time.time() - t0) / 3600 > STOP_RULES["max_hours"]:
-                reason = "max wall time"
-            elif ev and int(num(last["iteration"])) >= STOP_RULES["min_iters"] and plateaued(ev, STOP_RULES["patience"]):
-                reason = "converged (no eval improvement)"
-            elif ev and int(num(last["iteration"])) >= STOP_RULES["nogo_iters"] and num(last["fail_rate"]) > 0.9 and num(last.get("vel_fall_rate", 1)) > 0.9:
-                reason = "no progress"
-            if reason:
-                log(f"{name}: stopping at it {it}: {reason}")
-                open(os.path.join(log_dir, "STOP"), "w").write(reason + "\n")
+        for r in list(active):
+            info = r.poll()
+            runs_st.setdefault(r.name, {}).update(info, state="running")
+            if not info["running"]:
+                runs_st[r.name].update(r.finish(crit))
+                log(f"{r.name}: {runs_st[r.name]['state']} ({runs_st[r.name]['reason']}); best eval {runs_st[r.name]['best_eval']}")
+                active.remove(r)
         save_status()
-        log(f"{name}: it {it}, {st['it_per_s']} it/s, evals {len(ev)}, last eval {({k: last.get(k) for k in ('iteration', 'norm_return', 'fail_rate', 'vel_med_err', 'vel_fall_rate')})}")
-    # let the watcher score the final checkpoint, then stop it
-    final = max([int(f[5:11]) for f in os.listdir(log_dir) if f.startswith("ckpt_") and f.endswith(".pt")], default=0)
-    t_wait = time.time()
-    while final and time.time() - t_wait < 1800 and final not in [int(num(r["iteration"])) for r in read_csv(os.path.join(log_dir, "eval.csv"))]:
-        time.sleep(30)
-    os.killpg(evaler.pid, signal.SIGTERM)
-    ev = read_csv(os.path.join(log_dir, "eval.csv"))
-    best = best_row(ev, CRITERIA[name])
-    ok = best is not None and meets(best, CRITERIA[name]) and not reason.startswith(("crashed", "diverged"))
-    state = reason.split(" ")[0] if reason.startswith(("crashed", "diverged")) else "success" if ok else "failed"
-    st.update(state=state, reason=reason, best_eval=best, finished=time.strftime("%Y-%m-%d %H:%M:%S"),
-              criteria=CRITERIA[name])  # fmt: skip
+        log(f"{name}: " + " | ".join(f"{n.split('/')[-1]} it {s.get('iteration')} rb {s.get('rollbacks')} "
+                                     f"eval {s.get('last_eval', {}).get('norm_return')}/{s.get('last_eval', {}).get('vel_med_err')} {s.get('state')}"
+                                     for n, s in sorted(runs_st.items())))  # fmt: skip
+    states = [s["state"] for s in runs_st.values()]
+    n_ok = states.count("success")
+    if states.count("crashed") * 2 > len(states):
+        st["state"] = "crashed"
+    else:
+        st["state"] = "success" if n_ok * 2 >= len(states) else "failed"
+    st.update(n_success=n_ok, n_runs=len(states), finished=time.strftime("%Y-%m-%d %H:%M:%S"))
     save_status()
-    log(f"{name}: {st['state']} ({reason}); best eval {best}")
+    log(f"{name}: {st['state']} ({n_ok}/{len(states)} runs meet the criteria)")
     return st
 
 
@@ -200,20 +250,20 @@ def wait_for(path: str):
 
 
 def main():
-    s1 = run("exp1", [LAFAN], [LAFAN])
+    s1 = run_experiment("exp1", [LAFAN], [LAFAN], per_gpu=False)
     if s1["state"] != "success":
         log(f"exp1 {s1['state']}: did not pass the code check; stopping the chain")
         return
     wait_for(SONIC)
-    s2 = run("exp2", [SONIC, LAFAN], [SONIC, LAFAN])
-    if s2["state"] in ("crashed", "diverged"):
-        log(f"exp2 {s2['state']}; stopping the chain (fix, then rerun the orchestrator)")
+    s2 = run_experiment("exp2", [SONIC, LAFAN], [SONIC, LAFAN])
+    if s2["state"] == "crashed":
+        log("exp2 crashed; stopping the chain (fix, then rerun the orchestrator)")
         return
     loco = [SONIC, LAFAN] if s2["state"] == "success" else [LAFAN]
     status["exp3_loco_choice"] = "exp2" if s2["state"] == "success" else "exp1"
     save_status()
     wait_for(ALL)
-    run("exp3", [ALL], loco)
+    run_experiment("exp3", [ALL], loco)
     log("all experiments done")
 
 
