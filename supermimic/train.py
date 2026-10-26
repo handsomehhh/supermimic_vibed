@@ -30,7 +30,8 @@ parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
 parser.add_argument("--wm_batch", type=int, default=2048)
 parser.add_argument("--pi_batch", type=int, default=4096)
-parser.add_argument("--lr", type=float, default=2e-4, help="single-GPU learning rate; scaled by sqrt(#GPUs)")
+parser.add_argument("--lr", type=float, default=2e-4, help="single-GPU learning rate; scaled by sqrt(min(#GPUs, --lr_gpu_cap))")
+parser.add_argument("--lr_gpu_cap", type=int, default=2, help="the paper validates the sqrt scaling up to 2 GPUs; 8 GPUs at 5.7e-4 diverged")
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--lam", type=float, default=0.95)
 parser.add_argument("--action_noise", type=float, default=0.1)
@@ -72,7 +73,7 @@ use_warp_stream(dev)
 if WORLD > 1:
     dist.init_process_group("nccl", device_id=torch.device(dev))
 MAIN = RANK == 0
-LR = args.lr * math.sqrt(WORLD)
+LR = args.lr * math.sqrt(min(WORLD, args.lr_gpu_cap))
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

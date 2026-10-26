@@ -8,12 +8,14 @@ stops a run once it is done, diverged, or no longer improving.
 
 Every POLL seconds the monitor reads train_log.csv / eval.csv of the running experiment and writes
 STOP (the trainer saves a checkpoint and exits) when
-  - the trainer crashed, or losses are NaN/inf for 3 consecutive log rows (diverged),
+  - the trainer crashed, or diverged: losses NaN/inf for 3 consecutive log rows, the simulator reward of
+    the motion envs below half of its best for 3 consecutive log rows, or the latest evaluation's motion
+    return 0.3 below its best,
   - wall time exceeds max_hours,
   - after min_iters, none of the eval metrics improved for `patience` evaluations (converged),
   - after nogo_iters, motion fail rate and velocity fall rate are both still > 0.9 (no progress).
-A run succeeds if its best evaluation meets the experiment's criteria. A crash stops the chain; rerunning
-the orchestrator resumes the unfinished experiment from its last.pt. Status: logs/orchestrator.json.
+A run succeeds if its best evaluation meets the experiment's criteria. A crash or divergence stops the
+chain; rerunning the orchestrator resumes the unfinished experiment from its last.pt. Status: logs/orchestrator.json.
 
   nohup python tools/orchestrate.py > logs/orchestrator.log 2>&1 &
 """
@@ -152,8 +154,14 @@ def run(name: str, motion_packs: list[str], loco_packs: list[str]) -> dict:
             break
         if reason is None:
             bad = [r for r in tl[-3:] if any(not math.isfinite(num(r[k])) for k in ("wm_loss", "pi_loss"))]
+            sim = [num(r["sim_rew"]) for r in tl if num(r["iteration"]) >= 1000]
+            nr = [num(r["norm_return"]) for r in ev]
             if len(tl) >= 3 and len(bad) == 3:
                 reason = "diverged (NaN/inf losses)"
+            elif len(sim) > 10 and max(sim) > 0 and all(x < 0.5 * max(sim) for x in sim[-3:]):
+                reason = "diverged (simulator reward collapsed)"
+            elif len(nr) >= 2 and max(nr) - nr[-1] > 0.3:
+                reason = "diverged (evaluation return collapsed)"
             elif (time.time() - t0) / 3600 > STOP_RULES["max_hours"]:
                 reason = "max wall time"
             elif ev and int(num(last["iteration"])) >= STOP_RULES["min_iters"] and plateaued(ev, STOP_RULES["patience"]):
@@ -174,7 +182,7 @@ def run(name: str, motion_packs: list[str], loco_packs: list[str]) -> dict:
     ev = read_csv(os.path.join(log_dir, "eval.csv"))
     best = best_row(ev, CRITERIA[name])
     ok = best is not None and meets(best, CRITERIA[name]) and not reason.startswith(("crashed", "diverged"))
-    state = "crashed" if reason.startswith("crashed") else "success" if ok else "failed"
+    state = reason.split(" ")[0] if reason.startswith(("crashed", "diverged")) else "success" if ok else "failed"
     st.update(state=state, reason=reason, best_eval=best, finished=time.strftime("%Y-%m-%d %H:%M:%S"),
               criteria=CRITERIA[name])  # fmt: skip
     save_status()
@@ -195,8 +203,8 @@ def main():
         return
     wait_for(SONIC)
     s2 = run("exp2", [SONIC, LAFAN], [SONIC, LAFAN])
-    if s2["state"] == "crashed":
-        log("exp2 crashed; stopping the chain (rerun the orchestrator to resume)")
+    if s2["state"] in ("crashed", "diverged"):
+        log(f"exp2 {s2['state']}; stopping the chain (fix, then rerun the orchestrator)")
         return
     loco = [SONIC, LAFAN] if s2["state"] == "success" else [LAFAN]
     status["exp3_loco_choice"] = "exp2" if s2["state"] == "success" else "exp1"
