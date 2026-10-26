@@ -31,7 +31,6 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
-TORCHRUN = os.path.join(os.path.dirname(PY), "torchrun")
 NGPU = int(os.environ.get("NGPU", 8))
 POLL = 300
 PACKS = os.path.join(REPO, "data", "packs")
@@ -117,7 +116,7 @@ def run(name: str, motion_packs: list[str], loco_packs: list[str]) -> dict:
         log(f"{name}: already {st['state']}, skipping")
         return st
     resume = os.path.join(log_dir, "last.pt")
-    cmd = [TORCHRUN, "--standalone", f"--nproc_per_node={NGPU}", "supermimic/train.py", "--log_dir", log_dir,
+    cmd = [PY, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={NGPU}", "supermimic/train.py", "--log_dir", log_dir,
            "--motion_packs", *motion_packs, "--loco_packs", *loco_packs, "--iterations", str(STOP_RULES["max_iters"])]  # fmt: skip
     if os.path.exists(resume):
         cmd += ["--resume", resume]

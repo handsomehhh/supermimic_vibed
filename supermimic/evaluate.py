@@ -51,6 +51,8 @@ from supermimic.robot import default_joint_pos_list
 dev = args.device
 use_warp_stream(dev)
 torch.backends.cuda.matmul.allow_tf32 = True
+while not os.path.exists(os.path.join(args.run_dir, "args.json")):  # the trainer writes it at start-up
+    time.sleep(10)
 run_args = json.load(open(os.path.join(args.run_dir, "args.json")))
 kin = G1Kinematics(dev)
 motion = MotionLib.from_packs(run_args["motion_packs"], run_args["loco_packs"], kin, dev)

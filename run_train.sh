@@ -5,8 +5,7 @@ RUN=${1:-run}
 shift || true
 NGPU=${NGPU:-8}
 PY=${PY:-python}
-TORCHRUN="$(dirname "$(command -v "$PY")")/torchrun"
 cd "$(dirname "$0")"
 mkdir -p "logs/$RUN"
 tmux new-session -d -s "$RUN" \
-  "$TORCHRUN --standalone --nproc_per_node=$NGPU supermimic/train.py --log_dir logs/$RUN $* 2>&1 | tee -a logs/$RUN/stdout.log"
+  "$PY -m torch.distributed.run --standalone --nproc_per_node=$NGPU supermimic/train.py --log_dir logs/$RUN $* 2>&1 | tee -a logs/$RUN/stdout.log"
