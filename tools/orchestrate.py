@@ -37,7 +37,7 @@ NGPU = int(os.environ.get("NGPU", 8))
 POLL = 300
 PACKS = os.path.join(REPO, "data", "packs")
 LAFAN = os.path.join(PACKS, "lafan_loco.pt")
-SONIC = os.path.join(PACKS, "sonic_loco.pt")
+SONIC = os.path.join(PACKS, "sonic_loco_p1.pt")  # --plausible: 68 clips with velocity glitches removed
 ALL = os.path.join(PACKS, "all_g1.pt")
 STATUS = os.path.join(REPO, "logs", "orchestrator.json")
 
@@ -48,7 +48,8 @@ CRITERIA = {  # best evaluation must satisfy all
 }
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
 # stabilizers for the BPTT policy update (in-trainer rollback is on by default)
-TRAIN_ARGS = ["--pi_gn_skip", "5"]
+# lr 2e-4 on 8 GPUs (the single-GPU value): the sqrt-scaled rates diverged on BONES-SEED (logs/diag, logs/diag2)
+TRAIN_ARGS = ["--pi_gn_skip", "5", "--lr_gpu_cap", "1"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01}
 
 status = json.load(open(STATUS)) if os.path.exists(STATUS) else {}
