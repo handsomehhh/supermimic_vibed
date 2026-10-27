@@ -43,13 +43,15 @@ POLL = 300
 PACKS = os.path.join(REPO, "data", "packs")
 LAFAN = os.path.join(PACKS, "lafan_loco.pt")
 SONIC = os.path.join(PACKS, "sonic_loco_p1.pt")  # --plausible: 68 clips with velocity glitches removed
-ALL = os.path.join(PACKS, "all_g1.pt")
+ALL = os.path.join(PACKS, "all_g1.pt")  # --plausible: 4.4% of clips with impossible velocities removed
+ALL_RAW = os.path.join(PACKS, "all_g1_raw.pt")  # every clip of motion_data_used_g1 that loads
 STATUS = os.path.join(REPO, "logs", "orchestrator.json")
 
 CRITERIA = {  # best evaluation must satisfy all
     "exp1": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.12), "vel_med_err": ("<=", 0.35), "vel_fall_rate": ("<=", 0.10)},
     "exp2": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
     "exp3": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
+    "exp3_full": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
 }
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
@@ -218,6 +220,7 @@ def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], pe
               loco_packs=loco_packs, criteria=crit)  # fmt: skip
     save_status()
     active = list(runs)
+    replaced = set()  # GPUs that already got a replacement run
     while active:
         time.sleep(POLL)
         for r in list(active):
@@ -227,6 +230,12 @@ def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], pe
                 runs_st[r.name].update(r.finish(crit))
                 log(f"{r.name}: {runs_st[r.name]['state']} ({runs_st[r.name]['reason']}); best eval {runs_st[r.name]['best_eval']}")
                 active.remove(r)
+                # keep the GPU busy: a run that ended before min_iters gets one replacement seed while others still train
+                g = r.gpus[0]
+                if per_gpu and active and g not in replaced and info["iteration"] < STOP_RULES["min_iters"]:
+                    replaced.add(g)
+                    n = f"{name}/s{g + NGPU}"
+                    active.append(Run(n, os.path.join(REPO, "logs", n), [g], motion_packs, loco_packs, g + NGPU))
         save_status()
         log(f"{name}: " + " | ".join(f"{n.split('/')[-1]} it {s.get('iteration')} rb {s.get('rollbacks')} "
                                      f"eval {s.get('last_eval', {}).get('norm_return')}/{s.get('last_eval', {}).get('vel_med_err')} {s.get('state')}"
@@ -268,4 +277,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["exp3_full"]:  # exp3 with the unfiltered motion library, velocity library as chosen for exp3
+        loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
+        run_experiment("exp3_full", [ALL_RAW], loco)
+        log("exp3_full done")
+    else:
+        main()
