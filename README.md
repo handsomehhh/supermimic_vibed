@@ -43,10 +43,17 @@ median relative velocity error <= 0.30, fall rate <= 5% (exp1: <= 2/18 failed, e
 | exp1 | motion + velocity: LAFAN1 loco (18 clips, 1.2 h) | 1 x 8-GPU | yes | 0.862 / 0 of 18 / 0.071 / 0 |
 | exp2 | motion + velocity: BONES-SEED loco (41 h) + LAFAN1 loco | 8 x 1-GPU | 5 / 8 | 0.917 / 0 / 0.043 / 0 |
 | exp3 | motion: all of motion_data_used_g1 (469 h); velocity: exp2's loco | 8 x 1-GPU | 8 / 8 | 0.920 / 0.4% / 0.032 / 0 |
+| exp4 | as exp3, velocity commands 100% uniform (no reference commands, so no latent alignment) | 8 x 1-GPU | 8 / 8 | 0.917 / 0.5% / 0.029 / 0 |
+| exp4 resumed | exp4 continued from each exp3 run (~1.5 h more) | 8 x 1-GPU | 8 / 8 | 0.919 / 0.3% / 0.032 / 0 |
 
 exp3, all eight seeds (best evaluation): return 0.868-0.920, failed clips 0.4-1.0%, velocity median
 error 0.030-0.069, no falls, ~5.9 h per run. For reference, the paper's RL velocity encoder reports a
 median error of 0.16 (on its own library).
+
+exp3 vs exp4 (eight seeds each, ~35k iterations): motion tracking is the same (mean return 0.895 / 0.895);
+the median over seeds of the velocity error is 0.064 with 50% reference commands and 0.046 with 100% uniform
+commands, but the uniform-command encoder learns more slowly early on (0.65 vs 0.34 at 4k iterations; two seeds
+stalled for ~8k iterations). Resuming exp3 with uniform commands reaches 0.042 (mean return 0.902) after ~1.5 h.
 
 Lessons: data-parallel training on 8 GPUs diverged on BONES-SEED at every learning rate tried, while
 single-GPU runs mostly did not; 68 BONES-SEED loco clips with velocity glitches, oversampled by
