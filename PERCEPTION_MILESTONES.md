@@ -23,5 +23,30 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   521k on the plane (hfield–mesh collisions dominate). Risk found: MuJoCo-Warp caps hfield–convex-mesh contacts
   at 50 per pair; an open-loop fall on rough ground overflowed it and blew up (120 rad/s) → P2 adds primitive
   collision proxies for terrain training.
-- 2026-10-28 — P2 (PPO teacher with privileged height scan, collision proxies, curriculum, eval) delegated to Codex.
+- 2026-10-28 — **P2 code done** (`ba44978`, Codex + review): `LocoEnv` (rsl_rl VecEnv), PPO teacher with privileged
+  187-point height scan, rewards/curriculum/commands adapted from the user's mjlab G1 rough config, per-body
+  contact forces from MuJoCo-Warp contacts (standing foot load 322 N vs weight 327 N), collision proxies
+  (capsules/boxes, 25 mm foot spheres, 10 ms contact time constant — fixed a GPU-only bogus −4.36 m hfield contact
+  on 15 mm pads), STOP/resume, `eval_loco` (success = 3 m traversal per type x level). Local 200-iteration smoke
+  runs: reward and episode length rise, no blow-ups, no curriculum promotion yet (too short).
+- 2026-10-28 — **P2 batch 1 on the cluster** (8 x H100, 4096 envs each, ~0.56 it/s): full terrain seeds 0–4, flat
+  seed 0, full with initial level up to 4 (seeds 0, 1). Finding: **mesh collisions are unusable on terrain** —
+  111k blow-ups within 50 iterations, reward ~0; proxies: 0 blow-ups. Mesh run replaced by seed 4.
+- 2026-10-28 — **P3 code done** (`381cc4c`, Codex + review). Elevation map (2.0 x 1.2 m at 8 cm, terrain height
+  relative to the acquisition base + validity mask) with per-cell noise 1–3 cm, ±5 cm drift, ±5 cm / ±3°
+  registration error, 0–100 ms latency, ~10 Hz refresh, 5–10% dropout, body blind zone, sensor shadowing.
+  Student = 5-frame proprio history + map (1230 inputs, no privileged data); DAgger distillation (rsl_rl
+  `DistillationRunner`) then optional asymmetric PPO fine-tune; TorchScript/ONNX export + input spec (max
+  deviation 6e-7); CPU monitor (`tools/monitor_loco.py`, running on the cluster in tmux `loco_monitor`).
+- 2026-10-28 — Teachers at ~700 iterations: first curriculum promotions (mean level 0.02–0.15).
+- 2026-10-28 — **Teachers walk on terrain by ~3000 iterations** (~1.5 h at ~1 it/s): mean terrain level 3.9–5.1 of
+  9, eval success over all 7 types x 10 levels **0.80–0.90**, tracking error 0.17–0.20 m/s. Flat-only control:
+  level n/a, plateau at 13k iterations.
+- 2026-10-28 — **Mistake: monitor blow-up threshold was absolute (1000 per 1000 iterations)** — with 4096 envs x 24
+  steps that is 0.001% of transitions, which the guard handles harmlessly; it stopped all 7 healthy teachers at
+  ~3000 iterations and the GPUs sat idle ~3 h before it was noticed. Fixed: threshold 50k per 1000 iterations
+  (~0.05%), teachers resumed from `last.pt`, plus an idle-GPU/STOP alert watcher.
+- 2026-10-28 — **Student distillation started** on GPU 4 from teacher `full_s4` (it 3158, success 0.90;
+  snapshot `logs/loco/teacher_full_s4_it3158.pt`), noisy elevation map: after 150 iterations mean level 4.8,
+  tracking error 0.16 — imitates the teacher quickly.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
