@@ -132,7 +132,7 @@ class Player:
                 continue
             g = scn.geoms[scn.ngeom]
             mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_ARROW, np.zeros(3), np.zeros(3), np.zeros(9), np.array(rgba, np.float32))
-            mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, 0.025, base, base + vec)
+            mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, 0.04, base, base + vec)
             scn.ngeom += 1
 
     def run(self):

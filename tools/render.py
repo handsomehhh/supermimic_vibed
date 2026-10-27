@@ -71,7 +71,8 @@ def main():
             if not d[p + "alive"][i, c]:
                 text[1] += "   [fell / terminated]"
             mujoco.mj_kinematics(model, data)
-            cam.lookat[:] = [q[0], q[1], 0.75]
+            cam.lookat[:] = [q[0], q[1], 0.75 if kind == "trk" else 0.5]
+            cam.elevation = -12.0 if kind == "trk" else -32.0  # look down on the velocity arrows
             renderer.update_scene(data, camera=cam, scene_option=opt)
             if kind == "vel":
                 w, x, y, z = q[3:7]
@@ -85,7 +86,7 @@ def main():
                         continue
                     g = scn.geoms[scn.ngeom]
                     mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_ARROW, np.zeros(3), np.zeros(3), np.zeros(9), np.array(rgba, np.float32))
-                    mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, 0.025, base, base + vec)
+                    mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, 0.04, base, base + vec)
                     scn.ngeom += 1
             img = Image.fromarray(renderer.render())
             draw = ImageDraw.Draw(img)
