@@ -32,6 +32,28 @@ Newton/MuJoCo-Warp backend. This branch drops Isaac Lab and drives **MuJoCo-Warp
 the paper's **velocity-command interface** (App. B, G): a velocity encoder trained by RL through the
 same world model, jointly with motion tracking. Training is data parallel over the local GPUs.
 
+## Results of this branch (velocity-command interface, 2026-10-27)
+
+Evaluation: motion tracking on up to 1024 sampled motion clips (+512 velocity-library clips); velocity
+step test (App. G.2) on 672 commands x 4 trials. Pass criteria: return >= 0.75, fail rate <= 5%,
+median relative velocity error <= 0.30, fall rate <= 5% (exp1: <= 2/18 failed, error <= 0.35, falls <= 10%).
+
+| Experiment | Libraries | Runs | Passed | Best run: return / failed / vel. median err / falls |
+|---|---|---|---|---|
+| exp1 | motion + velocity: LAFAN1 loco (18 clips, 1.2 h) | 1 x 8-GPU | yes | 0.862 / 0 of 18 / 0.071 / 0 |
+| exp2 | motion + velocity: BONES-SEED loco (41 h) + LAFAN1 loco | 8 x 1-GPU | 5 / 8 | 0.917 / 0 / 0.043 / 0 |
+| exp3 | motion: all of motion_data_used_g1 (469 h); velocity: exp2's loco | 8 x 1-GPU | 8 / 8 | 0.920 / 0.4% / 0.032 / 0 |
+
+exp3, all eight seeds (best evaluation): return 0.868-0.920, failed clips 0.4-1.0%, velocity median
+error 0.030-0.069, no falls, ~5.9 h per run. For reference, the paper's RL velocity encoder reports a
+median error of 0.16 (on its own library).
+
+Lessons: data-parallel training on 8 GPUs diverged on BONES-SEED at every learning rate tried, while
+single-GPU runs mostly did not; 68 BONES-SEED loco clips with velocity glitches, oversampled by
+return-based reset sampling once the rest is tracked well, triggered the BPTT runaway (removed with
+`tools/pack_motions.py --plausible`); about 1/3 of exp2 seeds still went unstable despite in-trainer
+rollback and gradient-spike skipping.
+
 ## Layout
 
 | Path | What |
