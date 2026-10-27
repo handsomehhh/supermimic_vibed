@@ -20,6 +20,10 @@ from supermimic.train_ppo import LocoRunner, cfg_from_dict
 from supermimic.student import is_student, load_student
 
 
+DIRECTION = "legacy"
+TAG = {"legacy": "", "forward": "_fwd"}
+
+
 @torch.no_grad()
 def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", map_noise: bool = True) -> dict:
     ck = torch.load(checkpoint, map_location=device, weights_only=False)
@@ -47,7 +51,9 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
     env.qpos[:, 3], env.qpos[:, 6] = (yaw / 2).cos(), (yaw / 2).sin()
     env.cmd.zero_()
     backwards = (kinds == TILE_TYPES.index("slope_down")) | (kinds == TILE_TYPES.index("stairs_down"))
-    env.cmd[:, 0] = torch.where(backwards, -.6, .6)
+    # legacy: walk backwards out of the "down" pyramids (i.e. climb them backwards); forward: always walk forward,
+    # so stairs_up/slope_up tiles test descending and stairs_down/slope_down tiles test ascending
+    env.cmd[:, 0] = .6 if DIRECTION == "forward" else torch.where(backwards, -.6, .6)
     if student:
         policy = load_student(ck, device)
     else:
@@ -88,12 +94,12 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
 
 
 def write_result(checkpoint: Path, result: dict) -> None:
-    suffix = "_eval" + ("_noise_" + result["map_noise"] if "map_noise" in result else "") + ".json"
+    suffix = "_eval" + TAG[DIRECTION] + ("_noise_" + result["map_noise"] if "map_noise" in result else "") + ".json"
     destination = checkpoint.with_name(checkpoint.stem + suffix)
     temp = destination.with_suffix(".tmp")
     temp.write_text(json.dumps(result, indent=2))
     temp.replace(destination)
-    csv_path = checkpoint.parent / "eval_loco.csv"
+    csv_path = checkpoint.parent / f"eval_loco{TAG[DIRECTION]}.csv"
     # Re-evaluation replaces this iteration instead of accumulating duplicate rows.
     previous = []
     if csv_path.exists():
@@ -117,7 +123,10 @@ def main():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--poll_seconds", type=float, default=30)
     p.add_argument("--map_noise", choices=("on", "off", "both"), default="on")
+    p.add_argument("--direction", choices=("legacy", "forward"), default="legacy")
     args = p.parse_args()
+    global DIRECTION
+    DIRECTION = args.direction
     if args.trials < 1 or not (args.run_dir or args.ckpt):
         p.error("Provide --run_dir or --ckpt, and positive --trials")
     setup_device(args.device)
@@ -128,7 +137,7 @@ def main():
             ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
             modes = ([True, False] if args.map_noise == "both" else [args.map_noise == "on"]) if is_student(ck) else [None]
             for mode in modes:
-                suffix = "_eval" + ("_noise_" + ("on" if mode else "off") if mode is not None else "") + ".json"
+                suffix = "_eval" + TAG[DIRECTION] + ("_noise_" + ("on" if mode else "off") if mode is not None else "") + ".json"
                 if args.ckpt or not checkpoint.with_name(checkpoint.stem + suffix).exists():
                     todo.append((checkpoint, mode))
         if args.watch and todo:
