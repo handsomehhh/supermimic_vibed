@@ -48,6 +48,7 @@ parser.add_argument("--loco_packs", nargs="*", default=[], help="velocity-interf
 parser.add_argument("--vel_frac", type=float, default=0.5, help="share of envs and imagined rollouts on the velocity interface")
 parser.add_argument("--align_w", type=float, default=0.1)
 parser.add_argument("--reset_temp", type=float, default=25.0, help="softmax temperature of return-based reset sampling (0: uniform part only)")
+parser.add_argument("--ref_cmd_prob", type=float, default=0.5, help="share of velocity commands read from the reference motion (rest: uniform)")
 parser.add_argument("--pi_gn_skip", type=float, default=0.0, help="skip policy updates whose gradient norm exceeds this multiple of its running level (0: off)")
 parser.add_argument("--no_rollback", action="store_true", help="disable rollback to an in-memory snapshot when the policy update diverges")
 parser.add_argument("--rb_gn_factor", type=float, default=10.0, help="divergence: window gradient norm above this multiple of its healthy median")
@@ -376,7 +377,7 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp)
+env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp, ref_cmd_prob=args.ref_cmd_prob)
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 is_vel = env.is_vel
@@ -418,8 +419,7 @@ def collect(n_steps: int, stats: dict):
 
 STAT_KEYS = ["blown", "r", "r_v", "cmd_err", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
 stats = {k: [] for k in STAT_KEYS}
-if start_it == 0:
-    collect(args.warmup_steps, stats)
+collect(args.warmup_steps, stats)  # the replay buffer is not checkpointed: refill it on resume too
 COLS = ["iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm", "imag_survival",
         "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "v_loss_v", "imag_rew_v", "imag_survival_v", "align",
         "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups", "gn_enc",

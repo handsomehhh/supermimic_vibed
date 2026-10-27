@@ -52,6 +52,8 @@ CRITERIA = {  # best evaluation must satisfy all
     "exp2": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
     "exp3": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
     "exp3_full": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
+    "exp4": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
+    "exp4_resume": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
 }
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
@@ -142,13 +144,16 @@ def stop_reason(tl: list[dict], ev: list[dict], hours: float) -> str | None:
 class Run:
     """One training process (one or all GPUs) plus its evaluation watcher."""
 
-    def __init__(self, name: str, log_dir: str, gpus: list[int], motion_packs: list[str], loco_packs: list[str], seed: int):
+    def __init__(self, name: str, log_dir: str, gpus: list[int], motion_packs: list[str], loco_packs: list[str], seed: int,
+                 extra: list[str] = (), init_ckpt: str | None = None):  # fmt: skip
         self.name, self.log_dir, self.gpus = name, log_dir, gpus
         os.makedirs(log_dir, exist_ok=True)
         args = ["supermimic/train.py", "--log_dir", log_dir, "--motion_packs", *motion_packs, "--loco_packs", *loco_packs,
-                "--iterations", str(STOP_RULES["max_iters"]), "--seed", str(seed), *TRAIN_ARGS]  # fmt: skip
+                "--iterations", str(STOP_RULES["max_iters"]), "--seed", str(seed), *TRAIN_ARGS, *extra]  # fmt: skip
         if os.path.exists(os.path.join(log_dir, "last.pt")):
             args += ["--resume", os.path.join(log_dir, "last.pt")]
+        elif init_ckpt:  # continue another experiment's run (weights, optimizers, normalizers, iteration)
+            args += ["--resume", init_ckpt]
         if os.path.exists(os.path.join(log_dir, "STOP")):
             os.remove(os.path.join(log_dir, "STOP"))
         cmd = [PY, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={len(gpus)}", *args] if len(gpus) > 1 else [PY, *args]
@@ -205,8 +210,10 @@ class Run:
         return {"state": state, "reason": reason, "best_eval": best, "finished": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
-def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], per_gpu: bool = True) -> dict:
-    """per_gpu: one single-GPU run per GPU (seed = GPU index); else one run on all GPUs."""
+def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], per_gpu: bool = True, extra: list[str] = (),
+                   init_from: str | None = None) -> dict:  # fmt: skip
+    """per_gpu: one single-GPU run per GPU (seed = GPU index); else one run on all GPUs.
+    init_from: experiment whose run with the same seed initializes each run (from its last.pt)."""
     st = status.setdefault(name, {})
     if st.get("state") in ("success", "failed"):
         log(f"{name}: already {st['state']}, skipping")
@@ -214,7 +221,8 @@ def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], pe
     crit = CRITERIA[name]
     specs = [(f"{name}/s{g}", [g], g) for g in range(NGPU)] if per_gpu else [(name, list(range(NGPU)), 0)]
     runs_st = st.setdefault("runs", {})
-    runs = [Run(n, os.path.join(REPO, "logs", n), gpus, motion_packs, loco_packs, seed) for n, gpus, seed in specs
+    init = lambda seed: os.path.join(REPO, "logs", init_from, f"s{seed}", "last.pt") if init_from else None  # noqa: E731
+    runs = [Run(n, os.path.join(REPO, "logs", n), gpus, motion_packs, loco_packs, seed, extra, init(seed)) for n, gpus, seed in specs
             if runs_st.get(n, {}).get("state") not in ("success", "failed", "diverged")]  # fmt: skip
     st.update(state="running", started=st.get("started", time.strftime("%Y-%m-%d %H:%M:%S")), motion_packs=motion_packs,
               loco_packs=loco_packs, criteria=crit)  # fmt: skip
@@ -235,7 +243,7 @@ def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], pe
                 if per_gpu and active and g not in replaced and info["iteration"] < STOP_RULES["min_iters"]:
                     replaced.add(g)
                     n = f"{name}/s{g + NGPU}"
-                    active.append(Run(n, os.path.join(REPO, "logs", n), [g], motion_packs, loco_packs, g + NGPU))
+                    active.append(Run(n, os.path.join(REPO, "logs", n), [g], motion_packs, loco_packs, g + NGPU, extra, init(g)))
         save_status()
         log(f"{name}: " + " | ".join(f"{n.split('/')[-1]} it {s.get('iteration')} rb {s.get('rollbacks')} "
                                      f"eval {s.get('last_eval', {}).get('norm_return')}/{s.get('last_eval', {}).get('vel_med_err')} {s.get('state')}"
@@ -277,7 +285,12 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["exp3_full"]:  # exp3 with the unfiltered motion library, velocity library as chosen for exp3
+    if sys.argv[1:] == ["exp4"]:  # exp3 with 100% uniformly sampled velocity commands: from scratch, then resumed from exp3
+        loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
+        run_experiment("exp4", [ALL], loco, extra=["--ref_cmd_prob", "0"])
+        run_experiment("exp4_resume", [ALL], loco, extra=["--ref_cmd_prob", "0"], init_from="exp3")
+        log("exp4 done")
+    elif sys.argv[1:] == ["exp3_full"]:  # exp3 with the unfiltered motion library, velocity library as chosen for exp3
         loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
         run_experiment("exp3_full", [ALL_RAW], loco)
         log("exp3_full done")

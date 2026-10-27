@@ -53,10 +53,12 @@ class TrackingSim:
     """Batched G1 simulator. Call :func:`use_warp_stream` before constructing it."""
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99, eval_mode: bool = False,
-                 max_episode_steps: int = 500, reset_noise: bool = True, n_vel: int = 0, substeps: int = 4, reset_temp: float = 25.0):  # fmt: skip
+                 max_episode_steps: int = 500, reset_noise: bool = True, n_vel: int = 0, substeps: int = 4, reset_temp: float = 25.0,
+                 ref_cmd_prob: float = 0.5):  # fmt: skip
         self.device = dev = device
         self.N, self.n_vel = num_envs, n_vel
         self.reset_temp = reset_temp  # softmax temperature of return-based reset sampling (paper: 25)
+        self.ref_cmd_prob = ref_cmd_prob  # probability that a velocity env reads its command from the reference (paper: 0.5)
         self.motion, self.mdp, self.gamma = motion, mdp, gamma
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
@@ -157,7 +159,7 @@ class TrackingSim:
         if n == 0:
             return
         dev = self.device
-        self.cmd_ref[env_ids] = torch.rand(n, device=dev) < 0.5
+        self.cmd_ref[env_ids] = torch.rand(n, device=dev) < self.ref_cmd_prob
         u = self.cmd_lo + (self.cmd_hi - self.cmd_lo) * torch.rand(n, 3, device=dev)
         u = torch.where((torch.rand(n, 1, device=dev) < 0.1), 0.0, u)
         self.cmd[env_ids] = torch.where(self.cmd_ref[env_ids, None], self.motion.ref_cmd[self.f[env_ids]], u)
