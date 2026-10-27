@@ -49,4 +49,21 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
 - 2026-10-28 — **Student distillation started** on GPU 4 from teacher `full_s4` (it 3158, success 0.90;
   snapshot `logs/loco/teacher_full_s4_it3158.pt`), noisy elevation map: after 150 iterations mean level 4.8,
   tracking error 0.16 — imitates the teacher quickly.
+- 2026-10-28 — **Eval bug found**: the legacy eval walked *backwards* out of the "down" pyramids, i.e. measured
+  climbing stairs/slopes backwards; forward stair ascent was never measured (the 0% "stairs_down" scores were
+  backward climbing). Added `eval_loco --direction forward` (`89f37a8`).
+- 2026-10-28 — **Forward eval** (success over all levels / levels 7–9):
+
+  | Terrain | Teacher full_s4 it 6000 | Student it 3000, map noise on | off |
+  |---|---|---|---|
+  | overall | 0.948 | 0.932 | 0.936 |
+  | flat, rough, slopes up/down (≤25°) | 1.0 / 1.0 | 1.0 / 1.0 | 1.0 / 1.0 |
+  | boxes (≤25 cm) | 1.0 / 1.0 | 0.95 / 0.83 | 0.95 / 0.83 |
+  | stairs descend | 1.0 / 1.0 | 0.97 / 0.92 | 1.0 / 1.0 |
+  | **stairs ascend** | **0.64 / 0.0** | **0.60 / 0.12** | 0.60 / 0.0 |
+
+  Slopes, boxes, rough ground and stair descent are solved; the **student is insensitive to realistic map noise**
+  and within ~0.02 of the teacher. Open gap: **ascending steps above ~15 cm** (levels 7–9, 17–20 cm).
+- 2026-10-28 — P2.5 (stair ascent: foot clearance / stumble terms, outward-forward commands on stair tiles)
+  delegated to Codex.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
