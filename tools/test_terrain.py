@@ -22,7 +22,6 @@ import numpy as np
 import torch
 import warp as wp
 
-from supermimic.env import use_warp_stream
 from supermimic.robot import default_joint_pos_list, sim_model
 from supermimic.rotations import axis_angle_to_mat
 from supermimic.terrain import TILE_TYPES, HeightSampler, Terrain, TerrainCfg, add_hfield, generate, write_hfield
@@ -170,9 +169,13 @@ def standing_poses(m: mujoco.MjModel, terrain: Terrain | None, origins: np.ndarr
     d = mujoco.MjData(m)
     d.qpos[:3], d.qpos[3:7], d.qpos[7:] = 0, (1, 0, 0, 0), default_joint_pos_list()
     mujoco.mj_kinematics(m, d)
-    spheres = (m.geom_bodyid > 0) & (m.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE)
-    bottom = d.geom_xpos[spheres].copy()
-    bottom[:, 2] -= m.geom_size[spheres, 0]
+    feet = [m.body(s + "_ankle_roll_link").id for s in ("left", "right")]
+    geoms = np.flatnonzero(np.isin(m.geom_bodyid, feet) & (m.geom_contype != 0))
+    bottom = d.geom_xpos[geoms].copy()
+    for i, g in enumerate(geoms):
+        size = m.geom_size[g]
+        extent = size[0] if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE else abs(d.geom_xmat[g].reshape(3, 3)[2]) @ size
+        bottom[i, 2] -= extent
     xy = origins[:, None, :2] + bottom[None, :, :2]
     heights = np.zeros(xy.shape[:-1]) if terrain is None else HeightSampler(terrain, "cpu").sample(torch.tensor(xy)).numpy()
     poses = np.tile(d.qpos, (len(origins), 1))
@@ -242,6 +245,12 @@ def collision_points(m: mujoco.MjModel, device: str) -> tuple[torch.Tensor, torc
         elif kind == mujoco.mjtGeom.mjGEOM_CYLINDER:
             angle = np.arange(64) * 2 * np.pi / 64
             a = np.array([(size[0] * np.cos(t), size[0] * np.sin(t), z) for z in (-size[1], size[1]) for t in angle])
+        elif kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            theta, phi = np.meshgrid(np.linspace(0, np.pi, 17), np.arange(32) * 2 * np.pi / 32)
+            a = size[0] * np.stack((np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)), -1).reshape(-1, 3)
+            a[:, 2] += np.where(a[:, 2] >= 0, size[1], -size[1])
+        elif kind == mujoco.mjtGeom.mjGEOM_BOX:
+            a = np.array([(x, y, z) for x in (-size[0], size[0]) for y in (-size[1], size[1]) for z in (-size[2], size[2])])
         else:
             raise ValueError(f"Add clearance probes for geom {g}: {mujoco.mjtGeom(int(kind)).name}")
         points.append(a)
@@ -347,6 +356,7 @@ def benchmark(m: mujoco.MjModel, terrain: Terrain | None, origins: np.ndarray, a
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--collision", choices=("mesh", "proxy"), default="mesh")
     parser.add_argument("--device", default="cuda:0")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--cpu-only", action="store_true")
@@ -360,7 +370,9 @@ def main() -> int:
     cuda = not (args.cpu_only or args.warp_cpu) and torch.cuda.is_available()
     device = args.device if cuda else "cpu"
     if cuda:
-        use_warp_stream(device)
+        from supermimic.loco_env import setup_device
+        setup_device(device)
+        torch.backends.cuda.matmul.allow_tf32 = False  # sub-micrometer sampler assertions
     elif args.warp_cpu:
         wp.init()
         torch.set_num_threads(4)
@@ -378,7 +390,7 @@ def main() -> int:
     preview(terrain, args.preview)
     convention_checks(device)
     sampler_checks(terrain, device, args.seed, args.samples)
-    m = sim_model(terrain=terrain)
+    m = sim_model(terrain=terrain, collision=args.collision)
     assert m.geom("floor").type[0] == mujoco.mjtGeom.mjGEOM_HFIELD
     assert m.geom("floor").contype[0] == 0 and m.geom("floor").conaffinity[0] == 1
     collision_pairs(m)
@@ -389,7 +401,7 @@ def main() -> int:
         return 0 if args.cpu_only or args.warp_cpu else 2
     contact_checks(m, terrain, device)
     origins = terrain.origins.reshape(-1, 3)
-    flat_rate = benchmark(sim_model(), None, origins, args)
+    flat_rate = benchmark(sim_model(collision=args.collision), None, origins, args)
     terrain_rate = benchmark(m, terrain, origins, args)
     print(f"terrain / plane throughput: {terrain_rate / flat_rate:.3f}; simulation only, fixed default targets, implicitfast, 4 x 5 ms, one graph/control step, nconmax=128, njmax=600")
     print("ALL TERRAIN CHECKS PASS")

@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING
+from copy import deepcopy
+from itertools import product
+from typing import TYPE_CHECKING, Literal
+import xml.etree.ElementTree as ET
 
 import mujoco
+import numpy as np
 
 if TYPE_CHECKING:
     from .terrain import Terrain
@@ -114,8 +118,11 @@ def default_joint_pos_list() -> list[float]:
     return out
 
 
-def sim_model(timestep: float = 0.005, terrain: Terrain | None = None) -> mujoco.MjModel:
+def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
+              collision: Literal["mesh", "proxy"] = "mesh") -> mujoco.MjModel:
     """Free pelvis, position actuators, armature, plane or terrain; no self-collisions."""
+    if collision not in ("mesh", "proxy"):
+        raise ValueError(f"Unknown collision mode: {collision}")
     xml = open(MJCF_PATH).read()
     acts = []
     for name in G1_JOINT_NAMES:
@@ -131,6 +138,8 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None) -> mujoco
 
         xml = add_hfield(xml, terrain)
     m = _compile(xml)
+    if collision == "proxy":
+        m = _compile(_proxy_xml(xml, m))
     if terrain is not None:
         write_hfield(m, terrain)
     robot = m.geom_bodyid > 0
@@ -140,6 +149,77 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None) -> mujoco
     m.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
     m.opt.iterations, m.opt.ls_iterations = 10, 20
     return m
+
+
+def _proxy_xml(xml: str, model: mujoco.MjModel) -> str:
+    """Fit primitives in link coordinates; explicit URDF inertials stay untouched.
+
+    Mesh vertices are in MuJoCo's recentered principal frame, so transform them
+    through the compiled geom pose before fitting. Visual meshes are retained.
+    """
+    root = ET.fromstring(xml)
+    world = root.find("worldbody")
+    # MuJoCo numbers world geoms first even when the XML floor follows bodies.
+    geoms = list(world.findall("geom")) + [g for b in world.findall("body") for g in b.iter("geom")]
+    parents = {child: parent for parent in root.iter() for child in parent}
+    for g, geom in enumerate(geoms):
+        if model.geom_bodyid[g] == 0 or model.geom_contype[g] == 0:
+            continue
+        if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE:
+            # 25 mm sole pads, preserving the bottom plane and a 9 cm width.
+            # A 10 ms contact time constant prevents a pad center entering the
+            # hfield prism, where generic convex CCD can return a bad witness.
+            pos = model.geom_pos[g].copy()
+            pos[2] += .025 - model.geom_size[g, 0]
+            pos[1] = np.clip(pos[1], -.02, .02)
+            geom.set("size", "0.025")
+            geom.set("pos", " ".join(map(str, pos)))
+            geom.set("solref", "0.01 1")
+            continue
+        if model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
+            continue
+        mesh = model.geom_dataid[g]
+        start, count = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.geom_quat[g])
+        vertices = model.mesh_vert[start:start + count] @ rotation.reshape(3, 3).T + model.geom_pos[g]
+        lo, hi = vertices.min(0), vertices.max(0)
+        half = (hi - lo) / 2
+        body = model.body(model.geom_bodyid[g]).name
+        for attr in ("mesh", "quat", "pos", "euler", "axisangle"):
+            geom.attrib.pop(attr, None)
+        if any(name in body for name in ("pelvis", "torso", "head")):
+            geom.set("type", "box")
+            # The 50-contact cap applies to primitives too. Bound each box's
+            # surface footprint on the 5 cm hfield even when lying on its side.
+            counts = np.maximum(1, np.ceil(2 * half / .12).astype(int))
+            for number, index in enumerate(product(*(range(n) for n in counts))):
+                part = geom if number == 0 else deepcopy(geom)
+                part.set("pos", " ".join(map(str, lo + (2 * np.asarray(index) + 1) * half / counts)))
+                part.set("size", " ".join(map(str, half / counts)))
+                if number:
+                    parents[geom].append(part)
+        else:
+            # Principal mesh axes avoid inflating the radius of slanted limbs.
+            vertices = model.mesh_vert[start:start + count]
+            lo, hi = vertices.min(0), vertices.max(0)
+            center, half = (hi + lo) / 2, (hi - lo) / 2
+            axis = int(half.argmax())
+            radius = float(np.max(np.delete(half, axis)))
+            span = max(float(half[axis]) - radius, 0.001)
+            geom.set("type", "capsule")
+            geom.set("size", str(radius))
+            pieces = max(1, int(np.ceil(2 * span / .10)))
+            for number in range(pieces):
+                part = geom if number == 0 else deepcopy(geom)
+                a, b = center.copy(), center.copy()
+                a[axis] += -span + 2 * span * number / pieces
+                b[axis] += -span + 2 * span * (number + 1) / pieces
+                ends = np.stack((a, b)) @ rotation.reshape(3, 3).T + model.geom_pos[g]
+                part.set("fromto", " ".join(map(str, ends.ravel())))
+                if number:
+                    parents[geom].append(part)
+    return ET.tostring(root, encoding="unicode")
 
 
 def _compile(xml: str) -> mujoco.MjModel:
