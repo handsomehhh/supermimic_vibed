@@ -22,6 +22,7 @@ from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 
 from supermimic.loco_env import LocoCfg, LocoEnv, setup_device
+from supermimic.elevation_map import ElevationCfg
 from supermimic.terrain import TerrainCfg
 
 
@@ -88,6 +89,8 @@ class ValidPPO(PPO):
 def cfg_from_dict(values: dict) -> LocoCfg:
     values = dict(values)
     values["terrain"] = TerrainCfg(**values["terrain"])
+    if "elevation" in values:
+        values["elevation"] = ElevationCfg(**values["elevation"])
     return LocoCfg(**values)
 
 
@@ -109,11 +112,14 @@ class LocoRunner(OnPolicyRunner):
               "common_step_counter": self.env.common_step_counter,
               "curriculum_up": int(self.env.curriculum_up), "curriculum_down": int(self.env.curriculum_down),
               "total_blown": int(self.env.total_blown), "torch_rng": torch.get_rng_state(),
-              "cuda_rng": torch.cuda.get_rng_state(self.device)}
+              "cuda_rng": torch.cuda.get_rng_state(self.device), **self.checkpoint_extra()}
         for name in (f"ckpt_{iteration:06d}.pt", "last.pt"):
             path = self.log_dir / name
             torch.save(ck, str(path) + ".tmp")
             os.replace(str(path) + ".tmp", path)
+
+    def checkpoint_extra(self) -> dict:
+        return {}
 
     def resume(self, path: str) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)

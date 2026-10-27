@@ -1,0 +1,96 @@
+"""Deployable student model: measured proprioception history and onboard map only."""
+from copy import deepcopy
+
+import torch
+from torch import nn
+from tensordict import TensorDict
+from rsl_rl.models import MLPModel
+from rsl_rl.modules import EmpiricalNormalization
+
+
+class StudentNormalization(EmpiricalNormalization):
+    """Normalize proprioception; preserve metric heights and binary validity.
+
+    Per-cell empirical normalization is ill-conditioned for consistently blind
+    cells: making them valid at deployment would amplify heights by 100x.
+    """
+    def __init__(self, size, history_dim):
+        super().__init__(size)
+        self.history_dim = history_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        history = (x[..., :self.history_dim] - self._mean[..., :self.history_dim]) / (self._std[..., :self.history_dim] + self.eps)
+        return torch.cat((history, x[..., self.history_dim:]), -1)
+
+
+class StudentModel(MLPModel):
+    def __init__(self, obs, obs_groups, obs_set, output_dim, map_latent=64, **kwargs):
+        if obs_groups[obs_set] != ["policy_history", "elevation_map"]:
+            raise ValueError("Student inputs must be policy_history, elevation_map in that order")
+        self.history_dim = obs["policy_history"].shape[-1]
+        self.map_dim = obs["elevation_map"].shape[-1]
+        self.map_latent = map_latent
+        super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
+        if self.obs_normalization:
+            self.obs_normalizer = StudentNormalization(self.obs_dim, self.history_dim)
+        self.map_encoder = nn.Sequential(nn.Linear(self.map_dim, 128), nn.ELU(),
+                                         nn.Linear(128, map_latent), nn.ELU())
+
+    def _get_latent_dim(self):
+        return self.history_dim + self.map_latent
+
+    def get_latent(self, obs, masks=None, hidden_state=None):
+        x = super().get_latent(obs, masks, hidden_state)
+        return torch.cat((x[..., :self.history_dim], self.map_encoder(x[..., self.history_dim:])), -1)
+
+    def as_jit(self):
+        return ExportStudent(self)
+
+    def as_onnx(self, verbose=False):
+        return ExportStudent(self)
+
+
+class ExportStudent(nn.Module):
+    """Stateless interface: caller maintains history and map refreshes."""
+    def __init__(self, actor):
+        super().__init__()
+        self.history_dim = actor.history_dim
+        self.input_size = actor.obs_dim
+        self.obs_normalizer = deepcopy(actor.obs_normalizer)
+        self.map_encoder = deepcopy(actor.map_encoder)
+        self.mlp = deepcopy(actor.mlp)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        x = self.obs_normalizer(observations)
+        latent = torch.cat((x[..., :self.history_dim], self.map_encoder(x[..., self.history_dim:])), -1)
+        return self.mlp(latent)
+
+    def get_dummy_inputs(self):
+        return (torch.zeros(1, self.input_size),)
+
+    @property
+    def input_names(self):
+        return ["observations"]
+
+    @property
+    def output_names(self):
+        return ["actions"]
+
+
+def is_student(ck):
+    return ck.get("runner_cfg", {}).get("policy_type") == "student"
+
+
+def load_student(ck, device="cpu"):
+    """Load just the actor, without physics, teacher, optimizer or GPU allocation."""
+    cfg = ck["env_cfg"]
+    from .elevation_map import ElevationCfg
+    shape = ElevationCfg(**cfg["elevation"]).shape
+    obs = TensorDict({"policy_history": torch.zeros(1, 96 * cfg["history_length"], device=device),
+                      "elevation_map": torch.zeros(1, 2 * shape[0] * shape[1], device=device)}, [1])
+    name = "student" if "student_state_dict" in ck else "actor"
+    model_cfg = deepcopy(ck["runner_cfg"][name])
+    model_cfg.pop("class_name")
+    actor = StudentModel(obs, {name: ["policy_history", "elevation_map"]}, name, 29, **model_cfg).to(device)
+    actor.load_state_dict(ck[name + "_state_dict"])
+    return actor.eval()

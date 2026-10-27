@@ -13,6 +13,7 @@ from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
 from .env import MAX_JOINT_VEL, MAX_ROOT_VEL, use_warp_stream
+from .elevation_map import ElevationCfg, ElevationMap
 from .robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list, sim_model
 from .rotations import quat_to_mat
 from .terrain import HeightSampler, TILE_TYPES, TerrainCfg, generate
@@ -38,6 +39,8 @@ class LocoCfg:
     command_curriculum: bool = True
     scan_shape: tuple[int, int] = (17, 11)
     scan_size: tuple[float, float] = (1.6, 1.0)
+    elevation: ElevationCfg = field(default_factory=ElevationCfg)
+    history_length: int = 5
 
 
 def setup_device(device: str) -> None:
@@ -162,6 +165,13 @@ class LocoEnv(VecEnv):
         self.curriculum_up = self.total_blown.clone()
         self.curriculum_down = self.total_blown.clone()
         self.extras = {}
+        self.elevation = None
+        if self.cfg.elevation.enabled:
+            if self.cfg.history_length < 1:
+                raise ValueError("history_length must be positive")
+            self.elevation = ElevationMap(self.cfg.elevation, num_envs, device, self.dt, self.sampler)
+            self.policy_history = torch.zeros(num_envs, self.cfg.history_length, 96, device=device)
+            self.history_stamp = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         self.reset(self.ids)
         with wp.ScopedDevice(device), wp.ScopedCapture() as cap:
             self._normal.zero_()
@@ -246,6 +256,9 @@ class LocoEnv(VecEnv):
         self.push_left[ids] = torch.randint(250, 750, (len(ids),), device=self.device)
         if not self.eval_mode:
             self.resample_commands(ids)
+        if self.elevation is not None:
+            self.elevation.reset(ids)
+            self.history_stamp[ids] = -1
 
     def _state(self):
         R = quat_to_mat(self.qpos[:, 3:7])
@@ -266,9 +279,20 @@ class LocoEnv(VecEnv):
             policy[:, 9:38] += noise[:, 9:38] * .01
             policy[:, 38:67] += noise[:, 38:67] * 1.5
         scan = (self.sampler.scan(self.qpos[:, :3], R, self.grid) - self.stand_height).clamp(-1, 1)
-        return TensorDict({"policy": policy, "height_scan": scan,
-                           "critic": torch.cat((clean, scan, vel, self.friction[:, None]), -1)},
-                          batch_size=[self.num_envs], device=self.device)
+        groups = {"policy": policy, "height_scan": scan,
+                  "critic": torch.cat((clean, scan, vel, self.friction[:, None]), -1)}
+        if self.elevation is not None:
+            fresh = self.history_stamp < 0
+            advance = (self.history_stamp != self.common_step_counter) & ~fresh
+            self.policy_history[fresh] = policy[fresh, None]
+            self.policy_history[advance] = torch.cat((self.policy_history[advance, 1:], policy[advance, None]), 1)
+            self.history_stamp[:] = self.common_step_counter
+            groups["policy_history"] = self.policy_history.flatten(1).clone()
+            # Keep repeated reads and the latest history frame consistent.
+            groups["policy"] = self.policy_history[:, -1].clone()
+            groups["elevation_map"] = self.elevation.observe(
+                self.qpos[:, :3], torch.atan2(R[:, 1, 0], R[:, 0, 0]), self.common_step_counter)
+        return TensorDict(groups, batch_size=[self.num_envs], device=self.device)
 
     @torch.no_grad()
     def step(self, actions: torch.Tensor):
