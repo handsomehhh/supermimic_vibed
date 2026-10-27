@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import os
 import re
+from typing import TYPE_CHECKING
 
 import mujoco
+
+if TYPE_CHECKING:
+    from .terrain import Terrain
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 URDF_PATH = os.path.join(DATA_DIR, "g1_description", "g1_29dof_rev_1_0.urdf")
@@ -110,8 +114,8 @@ def default_joint_pos_list() -> list[float]:
     return out
 
 
-def sim_model(timestep: float = 0.005) -> mujoco.MjModel:
-    """Simulation model: free pelvis, position actuators, armature, ground plane; no self-collisions."""
+def sim_model(timestep: float = 0.005, terrain: Terrain | None = None) -> mujoco.MjModel:
+    """Free pelvis, position actuators, armature, plane or terrain; no self-collisions."""
     xml = open(MJCF_PATH).read()
     acts = []
     for name in G1_JOINT_NAMES:
@@ -122,7 +126,13 @@ def sim_model(timestep: float = 0.005) -> mujoco.MjModel:
     floor = '<geom name="floor" type="plane" size="0 0 0.05" contype="0" conaffinity="1" condim="3"/>'
     xml = xml.replace("<worldbody>", "<worldbody>\n    " + floor, 1)
     xml = xml.replace("</mujoco>", "  <actuator>\n    " + "\n    ".join(acts) + "\n  </actuator>\n</mujoco>", 1)
+    if terrain is not None:
+        from .terrain import add_hfield, write_hfield
+
+        xml = add_hfield(xml, terrain)
     m = _compile(xml)
+    if terrain is not None:
+        write_hfield(m, terrain)
     robot = m.geom_bodyid > 0
     m.geom_conaffinity[robot] = 0  # robot geoms collide with the floor only
     m.opt.timestep = timestep
