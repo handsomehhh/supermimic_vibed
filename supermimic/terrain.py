@@ -179,7 +179,8 @@ class HeightSampler:
 
     def sample(self, xy: torch.Tensor) -> torch.Tensor:
         """Bilinear world height for (..., 2), clamped to the map's inclusive bounds."""
-        uv = (xy - self.offset) / self.resolution
+        # non-finite queries (e.g. body positions of a blown-up world before rollback) must not index out of range
+        uv = torch.nan_to_num((xy - self.offset) / self.resolution, nan=0.0, posinf=0.0, neginf=0.0)
         x = uv[..., 0].clamp(0, self.heights.shape[1] - 1)
         y = uv[..., 1].clamp(0, self.heights.shape[0] - 1)
         ix = x.long().clamp(max=self.heights.shape[1] - 2)
