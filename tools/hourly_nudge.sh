@@ -22,9 +22,9 @@ if ! flock -n 9; then
 fi
 idle=$(( ($(date +%s) - $(stat -c %Y "$TRANSCRIPT")) / 60 ))
 # a turn in progress: wait (up to 50 min) for it to end instead of skipping the hour
-for _ in $(seq 50); do
+for i in $(seq 50); do
   { [ "$idle" -ge "$IDLE_MINUTES" ] || [ -n "$old" ]; } && break
-  [ "$_" = 1 ] && echo "$(date -u +%FT%TZ) turn in progress (idle ${idle} min), waiting" >> "$LOG"
+  [ "$i" = 1 ] && echo "$(date -u +%FT%TZ) turn in progress (idle ${idle} min), waiting" >> "$LOG"
   sleep 60
   idle=$(( ($(date +%s) - $(stat -c %Y "$TRANSCRIPT")) / 60 ))
 done
