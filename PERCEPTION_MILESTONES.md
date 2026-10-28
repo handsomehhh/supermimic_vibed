@@ -171,3 +171,10 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   ascent 0.98. From the second from-scratch teacher (`scratch_outward_s1` it 7112): 0.994 / 0.91. Without the CNN
   (MLP map encoder, same teacher, stairs mix): 0.995 / 0.93 at it 5000 — with a good teacher the CNN matters less.
   5-frame history: 0.991 / 0.96 at it 4000, unstable after. `tools/play_loco.py` plays any of these locally.
+- 2026-10-28 — **Deployable depth v1.** PPO fine-tune of the depth student (`student_depth_mix_ppo`, from
+  `student_depth_scratchT_mix` it 3000) it 2000: robust L7–9 overall **0.998**, ascent **0.97**, descent 1.00;
+  exported to `logs/loco/student_depth_mix_ppo/export_depth_v1/` (ONNX max error 3e-5). Unlike the map student
+  with the old teacher, PPO here improves without trading ascent for descent. Seeds 1/2 of the depth distillation
+  reach 0.99–0.996 / ascent 0.85–0.96 at it 2000. Training on noise-free depth and evaluating with noise
+  generalises badly (0.967, descent 0.60): the sensor noise model matters for depth. Running: PPO from seed 2 and
+  from it 5000, and a PPO fine-tune of the map v2 student.
