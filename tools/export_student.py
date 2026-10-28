@@ -1,4 +1,4 @@
-"""Export a P3 actor + normalizer to TorchScript/ONNX and verify both on CPU."""
+"""Export an MLP/CNN student + normalizer to TorchScript/ONNX and verify both on CPU."""
 from __future__ import annotations
 
 import argparse
@@ -76,9 +76,9 @@ def export(checkpoint, out):
     scripted = torch.jit.script(model)
     scripted.save(str(out / "student.ts"))
     scripted = torch.jit.load(str(out / "student.ts")).eval()
-    dummy = torch.zeros(1, actor.obs_dim)
-    torch.onnx.export(model, (dummy,), str(out / "student.onnx"), dynamo=False, opset_version=18,
-                      input_names=["observations"], output_names=["actions"],
+    onnx_model = actor.as_onnx().eval()
+    torch.onnx.export(onnx_model, onnx_model.get_dummy_inputs(), str(out / "student.onnx"), dynamo=False, opset_version=18,
+                      input_names=onnx_model.input_names, output_names=onnx_model.output_names,
                       dynamic_axes={"observations": {0: "batch"}, "actions": {0: "batch"}})
     graph = onnx.load(str(out / "student.onnx"))
     onnx.checker.check_model(graph)

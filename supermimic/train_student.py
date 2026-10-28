@@ -18,6 +18,7 @@ from rsl_rl.runners import DistillationRunner
 from supermimic.loco_env import LocoEnv, setup_device
 from supermimic.train_ppo import LocoRunner, cfg_from_dict, runner_config
 from supermimic.student import is_student
+from supermimic.terrain import TILE_TYPES
 
 
 def student_config():
@@ -72,6 +73,11 @@ def main():
     p.add_argument("--history_length", type=int, default=5)
     p.add_argument("--map_config", type=Path, help="JSON overrides for ElevationCfg (new distillation runs)")
     p.add_argument("--map_noise", choices=("on", "off"), default="on")
+    p.add_argument("--map_encoder", choices=("mlp", "cnn"), default="mlp", help="Map encoder (new distillation runs)")
+    p.add_argument("--hidden_dims", type=int, nargs="+", default=[256, 128], help="Policy MLP widths (new distillation runs)")
+    p.add_argument("--map_latent", type=int, default=64, help="Map latent size (new distillation runs)")
+    p.add_argument("--terrain_proportions", type=float, nargs=len(TILE_TYPES),
+                   help="Terrain weights, including on resume: " + ", ".join(TILE_TYPES))
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--log_dir", required=True)
@@ -81,6 +87,12 @@ def main():
     source = args.resume or (args.teacher if args.stage == "distill" else args.student)
     if not source or min(args.num_envs, args.history_length, args.save_every, args.log_every) < 1 or args.iterations < 0:
         p.error("Provide --teacher for distill, --student for ppo, or --resume; counts must be positive")
+    if min(args.hidden_dims) < 1 or args.map_latent < 1:
+        p.error("hidden_dims and map_latent must be positive")
+    if args.terrain_proportions is not None:
+        weights = np.asarray(args.terrain_proportions)
+        if not np.isfinite(weights).all() or (weights < 0).any() or not 0 < weights.sum() < np.inf:
+            p.error("terrain_proportions must be finite nonnegative weights with positive sum")
     ck = torch.load(source, map_location="cpu", weights_only=False)
     cfg = cfg_from_dict(ck["env_cfg"])
     if args.resume:
@@ -97,11 +109,16 @@ def main():
             cfg.elevation = ElevationCfg(**{**asdict(cfg.elevation), **json.loads(args.map_config.read_text())})
             cfg.elevation.enabled = True
         train_cfg = distillation_config(ck)
+        train_cfg["student"].update(map_encoder=args.map_encoder, hidden_dims=args.hidden_dims, map_latent=args.map_latent)
+        if args.map_encoder == "cnn":
+            train_cfg["student"]["map_shape"] = list(cfg.elevation.shape)
     else:
         if not is_student(ck):
             p.error("--student must be a P3 student checkpoint")
         cfg.elevation.noise = args.map_noise == "on"
         train_cfg = finetune_config(ck)
+    if args.terrain_proportions is not None:
+        cfg.terrain.proportions = tuple(args.terrain_proportions)
     setup_device(args.device)
     random.seed(args.seed)
     np.random.seed(args.seed)

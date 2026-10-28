@@ -23,18 +23,49 @@ class StudentNormalization(EmpiricalNormalization):
         return torch.cat((history, x[..., self.history_dim:]), -1)
 
 
+class ConvMapEncoder(nn.Module):
+    def __init__(self, shape, map_latent):
+        super().__init__()
+        self.nx, self.ny = shape
+        self.map_latent = map_latent
+        self.layers = nn.Sequential(
+            nn.Conv2d(2, 16, 3, padding=1), nn.ELU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ELU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ELU(), nn.Flatten(),
+            nn.Linear(32 * ((self.nx + 1) // 2) * ((self.ny + 1) // 2), map_latent), nn.ELU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = list(x.shape)
+        shape[-1] = self.map_latent
+        # ElevationMap: all heights then all masks, x outer and y inner.
+        return self.layers(x.reshape(-1, 2, self.nx, self.ny)).reshape(shape)
+
+
 class StudentModel(MLPModel):
-    def __init__(self, obs, obs_groups, obs_set, output_dim, map_latent=64, **kwargs):
+    def __init__(self, obs, obs_groups, obs_set, output_dim, map_latent=64,
+                 map_encoder="mlp", map_shape=None, **kwargs):
         if obs_groups[obs_set] != ["policy_history", "elevation_map"]:
             raise ValueError("Student inputs must be policy_history, elevation_map in that order")
         self.history_dim = obs["policy_history"].shape[-1]
         self.map_dim = obs["elevation_map"].shape[-1]
         self.map_latent = map_latent
+        self.map_encoder_type = map_encoder
+        if map_encoder not in ("mlp", "cnn"):
+            raise ValueError("map_encoder must be mlp or cnn")
+        if map_latent < 1:
+            raise ValueError("map_latent must be positive")
+        if map_encoder == "cnn" and (map_shape is None or len(map_shape) != 2 or
+                                     any(not isinstance(n, int) or n < 1 for n in map_shape) or
+                                     2 * map_shape[0] * map_shape[1] != self.map_dim):
+            raise ValueError("CNN map_shape must be (nx, ny) with 2 * nx * ny == elevation_map size")
         super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
         if self.obs_normalization:
             self.obs_normalizer = StudentNormalization(self.obs_dim, self.history_dim)
-        self.map_encoder = nn.Sequential(nn.Linear(self.map_dim, 128), nn.ELU(),
-                                         nn.Linear(128, map_latent), nn.ELU())
+        if map_encoder == "cnn":
+            self.map_encoder = ConvMapEncoder(map_shape, map_latent)
+        else:
+            self.map_encoder = nn.Sequential(nn.Linear(self.map_dim, 128), nn.ELU(),
+                                             nn.Linear(128, map_latent), nn.ELU())
 
     def _get_latent_dim(self):
         return self.history_dim + self.map_latent
@@ -91,6 +122,9 @@ def load_student(ck, device="cpu"):
     name = "student" if "student_state_dict" in ck else "actor"
     model_cfg = deepcopy(ck["runner_cfg"][name])
     model_cfg.pop("class_name")
+    if model_cfg.get("map_encoder", "mlp") == "cnn":
+        if tuple(model_cfg.setdefault("map_shape", shape)) != shape:
+            raise ValueError("Student map_shape does not match checkpoint elevation config")
     actor = StudentModel(obs, {name: ["policy_history", "elevation_map"]}, name, 29, **model_cfg).to(device)
     actor.load_state_dict(ck[name + "_state_dict"])
     return actor.eval()
