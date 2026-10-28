@@ -122,4 +122,14 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   **stair ascent 0.73 (0.17 at L7–9)** — inherits the early teacher's weakness; clean vs noisy map within 0.01.
   Students from the outward-command teachers (`student_outward_h10`, `student_i4s1stairs_h10`) should close it;
   a from-scratch teacher with outward commands (`scratch_outward_s0`) checks the fix without fine-tuning.
+- 2026-10-28 — **Deployable v1**: `student_outward_h10_ppo` it 3000 (10-frame history student distilled from the
+  outward teacher, then PPO fine-tuned), exported to `logs/loco/student_outward_h10_ppo/export_v1/`. Robust eval,
+  noisy map: **0.983** overall; stair ascent L7–9 **0.67** (v0: 0.17), descent L7–9 0.98, boxes L7–9 0.99,
+  slopes 1.0. Other students from the new teachers plateau at robust 0.94–0.98, ascent L7–9 0.43–0.65.
+- 2026-10-28 — **Diagnosis: perception noise is not the bottleneck.** The same v1 student with an exact, fully
+  valid map (no noise, no blind zone, no latency): overall 0.979, ascent L7–9 **0.58** (vs 0.67 noisy). The
+  teacher–student gap on 17–20 cm steps (0.99 vs 0.67) comes from the student policy / distillation, not the
+  map. Next: larger map encoder, stair-weighted distillation or longer PPO on stairs. Running for reference: a
+  clean-map student (upper bound) and a PPO replicate (seed 1). From-scratch outward teacher at 6000 iterations:
+  robust 0.983, ascent L7–9 0.885 (still improving) — confirms the command fix without fine-tuning.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
