@@ -22,6 +22,11 @@ from supermimic.student import is_student, load_student
 
 DIRECTION = "legacy"
 TAG = {"legacy": "", "forward": "_fwd"}
+YAW_DEG = 5.0  # start headings spread uniformly over +/- YAW_DEG around the tile's x axis
+
+
+def tag() -> str:
+    return TAG[DIRECTION] + (f"_yaw{YAW_DEG:g}" if YAW_DEG != 5.0 else "")
 
 
 @torch.no_grad()
@@ -47,7 +52,8 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
     env.kinds.copy_(kinds)
     env.reset(env.ids)
     # Reproducible +/- 5 degree headings provide distinct trials at the exact center.
-    yaw = torch.linspace(-.0872665, .0872665, trials, device=device).repeat(len(cases)) if trials > 1 else torch.zeros(env.num_envs, device=device)
+    half = YAW_DEG * torch.pi / 180
+    yaw = torch.linspace(-half, half, trials, device=device).repeat(len(cases)) if trials > 1 else torch.zeros(env.num_envs, device=device)
     env.qpos[:, 3], env.qpos[:, 6] = (yaw / 2).cos(), (yaw / 2).sin()
     env.cmd.zero_()
     backwards = (kinds == TILE_TYPES.index("slope_down")) | (kinds == TILE_TYPES.index("stairs_down"))
@@ -94,12 +100,12 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
 
 
 def write_result(checkpoint: Path, result: dict) -> None:
-    suffix = "_eval" + TAG[DIRECTION] + ("_noise_" + result["map_noise"] if "map_noise" in result else "") + ".json"
+    suffix = "_eval" + tag() + ("_noise_" + result["map_noise"] if "map_noise" in result else "") + ".json"
     destination = checkpoint.with_name(checkpoint.stem + suffix)
     temp = destination.with_suffix(".tmp")
     temp.write_text(json.dumps(result, indent=2))
     temp.replace(destination)
-    csv_path = checkpoint.parent / f"eval_loco{TAG[DIRECTION]}.csv"
+    csv_path = checkpoint.parent / f"eval_loco{tag()}.csv"
     # Re-evaluation replaces this iteration instead of accumulating duplicate rows.
     previous = []
     if csv_path.exists():
@@ -124,9 +130,10 @@ def main():
     p.add_argument("--poll_seconds", type=float, default=30)
     p.add_argument("--map_noise", choices=("on", "off", "both"), default="on")
     p.add_argument("--direction", choices=("legacy", "forward"), default="legacy")
+    p.add_argument("--yaw_deg", type=float, default=5.0, help="start heading spread (+/- degrees)")
     args = p.parse_args()
-    global DIRECTION
-    DIRECTION = args.direction
+    global DIRECTION, YAW_DEG
+    DIRECTION, YAW_DEG = args.direction, args.yaw_deg
     if args.trials < 1 or not (args.run_dir or args.ckpt):
         p.error("Provide --run_dir or --ckpt, and positive --trials")
     setup_device(args.device)
@@ -137,7 +144,7 @@ def main():
             ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
             modes = ([True, False] if args.map_noise == "both" else [args.map_noise == "on"]) if is_student(ck) else [None]
             for mode in modes:
-                suffix = "_eval" + TAG[DIRECTION] + ("_noise_" + ("on" if mode else "off") if mode is not None else "") + ".json"
+                suffix = "_eval" + tag() + ("_noise_" + ("on" if mode else "off") if mode is not None else "") + ".json"
                 if args.ckpt or not checkpoint.with_name(checkpoint.stem + suffix).exists():
                     todo.append((checkpoint, mode))
         if args.watch and todo:
