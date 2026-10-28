@@ -23,10 +23,11 @@ from supermimic.student import is_student, load_student
 DIRECTION = "legacy"
 TAG = {"legacy": "", "forward": "_fwd"}
 YAW_DEG = 5.0  # start headings spread uniformly over +/- YAW_DEG around the tile's x axis
+ROBUST = False  # random headings, +/-0.25 m start offsets and every tile of the type (not just the first)
 
 
 def tag() -> str:
-    return TAG[DIRECTION] + (f"_yaw{YAW_DEG:g}" if YAW_DEG != 5.0 else "")
+    return TAG[DIRECTION] + (f"_yaw{YAW_DEG:g}" if YAW_DEG != 5.0 else "") + ("_rb" if ROBUST else "")
 
 
 @torch.no_grad()
@@ -46,14 +47,23 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
     env = LocoEnv(rows * len(TILE_TYPES) * trials, cfg, device, eval_mode=True)
     cases = torch.cartesian_prod(torch.arange(rows, device=device), torch.arange(len(TILE_TYPES), device=device))
     levels, kinds = cases.repeat_interleave(trials, dim=0).T
-    columns = torch.stack([(env.tile_types[0] == k).nonzero()[0, 0] for k in range(len(TILE_TYPES))])
+    trial = torch.arange(env.num_envs, device=device) % trials
+    if ROBUST:  # cycle through every tile of the type
+        tiles = [(env.tile_types[0] == k).nonzero()[:, 0] for k in range(len(TILE_TYPES))]
+        cols = torch.stack([tiles[k][t % len(tiles[k])] for k, t in zip(kinds.tolist(), trial.tolist())])
+    else:
+        cols = torch.stack([(env.tile_types[0] == k).nonzero()[0, 0] for k in range(len(TILE_TYPES))])[kinds]
     env.levels.copy_(levels)
-    env.columns.copy_(columns[kinds])
+    env.columns.copy_(cols)
     env.kinds.copy_(kinds)
     env.reset(env.ids)
     # Reproducible +/- 5 degree headings provide distinct trials at the exact center.
     half = YAW_DEG * torch.pi / 180
     yaw = torch.linspace(-half, half, trials, device=device).repeat(len(cases)) if trials > 1 else torch.zeros(env.num_envs, device=device)
+    if ROBUST:
+        g = torch.Generator(device=device).manual_seed(0)
+        yaw = (torch.rand(env.num_envs, device=device, generator=g) * 2 - 1) * half
+        env.qpos[:, :2] += (torch.rand(env.num_envs, 2, device=device, generator=g) * 2 - 1) * .25
     env.qpos[:, 3], env.qpos[:, 6] = (yaw / 2).cos(), (yaw / 2).sin()
     env.cmd.zero_()
     backwards = (kinds == TILE_TYPES.index("slope_down")) | (kinds == TILE_TYPES.index("stairs_down"))
@@ -131,9 +141,10 @@ def main():
     p.add_argument("--map_noise", choices=("on", "off", "both"), default="on")
     p.add_argument("--direction", choices=("legacy", "forward"), default="legacy")
     p.add_argument("--yaw_deg", type=float, default=5.0, help="start heading spread (+/- degrees)")
+    p.add_argument("--robust", action="store_true", help="random headings/offsets over every tile of each type")
     args = p.parse_args()
-    global DIRECTION, YAW_DEG
-    DIRECTION, YAW_DEG = args.direction, args.yaw_deg
+    global DIRECTION, YAW_DEG, ROBUST
+    DIRECTION, YAW_DEG, ROBUST = args.direction, args.yaw_deg, args.robust
     if args.trials < 1 or not (args.run_dir or args.ckpt):
         p.error("Provide --run_dir or --ckpt, and positive --trials")
     setup_device(args.device)
