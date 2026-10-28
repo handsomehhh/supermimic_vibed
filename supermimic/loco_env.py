@@ -14,6 +14,7 @@ from tensordict import TensorDict
 
 from .env import MAX_JOINT_VEL, MAX_ROOT_VEL, use_warp_stream
 from .elevation_map import ElevationCfg, ElevationMap
+from .depth_camera import DepthCfg, DepthCamera
 from .robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list, sim_model
 from .rotations import quat_to_mat
 from .terrain import HeightSampler, TILE_TYPES, TerrainCfg, generate
@@ -41,6 +42,7 @@ class LocoCfg:
     scan_shape: tuple[int, int] = (17, 11)
     scan_size: tuple[float, float] = (1.6, 1.0)
     elevation: ElevationCfg = field(default_factory=ElevationCfg)
+    depth: DepthCfg = field(default_factory=DepthCfg)
     history_length: int = 5
     # Opt-in P2.5 terms: disabled branches consume no random numbers or observations.
     foot_clearance_weight: float = 0.0
@@ -204,10 +206,18 @@ class LocoEnv(VecEnv):
         self.curriculum_down = self.total_blown.clone()
         self.extras = {}
         self.elevation = None
+        self.depth = None
+        if self.cfg.depth.enabled:
+            self.depth = DepthCamera(self.cfg.depth, num_envs, device, self.dt, self.sampler)
+            self.depth_body = m.body(self.cfg.depth.mount_link).id
+            with wp.ScopedDevice(device), wp.ScopedCapture() as cap:
+                mjw.kinematics(self.model, self.data)
+            self.depth_pose_graph = cap.graph
         if self.cfg.elevation.enabled:
+            self.elevation = ElevationMap(self.cfg.elevation, num_envs, device, self.dt, self.sampler)
+        if self.elevation is not None or self.depth is not None:
             if self.cfg.history_length < 1:
                 raise ValueError("history_length must be positive")
-            self.elevation = ElevationMap(self.cfg.elevation, num_envs, device, self.dt, self.sampler)
             self.policy_history = torch.zeros(num_envs, self.cfg.history_length, 96, device=device)
             self.history_stamp = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         self.reset(self.ids)
@@ -322,6 +332,9 @@ class LocoEnv(VecEnv):
                 self._heading_commands()
         if self.elevation is not None:
             self.elevation.reset(ids)
+        if self.depth is not None:
+            self.depth.reset(ids)
+        if self.elevation is not None or self.depth is not None:
             self.history_stamp[ids] = -1
 
     def _state(self):
@@ -352,7 +365,7 @@ class LocoEnv(VecEnv):
         scan = (self.sampler.scan(self.qpos[:, :3], R, self.grid) - self.stand_height).clamp(-1, 1)
         groups = {"policy": policy, "height_scan": scan,
                   "critic": torch.cat((clean, scan, vel, self.friction[:, None]), -1)}
-        if self.elevation is not None:
+        if self.elevation is not None or self.depth is not None:
             fresh = self.history_stamp < 0
             advance = (self.history_stamp != self.common_step_counter) & ~fresh
             self.policy_history[fresh] = policy[fresh, None]
@@ -361,8 +374,15 @@ class LocoEnv(VecEnv):
             groups["policy_history"] = self.policy_history.flatten(1).clone()
             # Keep repeated reads and the latest history frame consistent.
             groups["policy"] = self.policy_history[:, -1].clone()
+        if self.elevation is not None:
             groups["elevation_map"] = self.elevation.observe(
                 self.qpos[:, :3], torch.atan2(R[:, 1, 0], R[:, 0, 0]), self.common_step_counter)
+        if self.depth is not None:
+            # Resets, rollback and eval pose edits may invalidate cached body frames.
+            wp.capture_launch(self.depth_pose_graph)
+            groups["depth_image"] = self.depth.observe(
+                wp.to_torch(self.data.xpos)[:, self.depth_body],
+                wp.to_torch(self.data.xmat)[:, self.depth_body].reshape(-1, 3, 3), self.common_step_counter)
         return TensorDict(groups, batch_size=[self.num_envs], device=self.device)
 
     @torch.no_grad()

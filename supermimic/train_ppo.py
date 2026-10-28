@@ -24,6 +24,7 @@ from rsl_rl.storage import RolloutStorage
 
 from supermimic.loco_env import LocoCfg, LocoEnv, STAIRS_OPTIONS, setup_device
 from supermimic.elevation_map import ElevationCfg
+from supermimic.depth_camera import DepthCfg
 from supermimic.terrain import TerrainCfg
 
 
@@ -92,12 +93,16 @@ def cfg_from_dict(values: dict) -> LocoCfg:
     values["terrain"] = TerrainCfg(**values["terrain"])
     if "elevation" in values:
         values["elevation"] = ElevationCfg(**values["elevation"])
+    if "depth" in values:
+        values["depth"] = DepthCfg(**values["depth"])
     return LocoCfg(**values)
 
 
 def cfg_to_dict(cfg: LocoCfg) -> dict:
-    """Preserve the old serialized config exactly when P2.5 options are defaults."""
+    """Preserve the old serialized config when stair/depth options are defaults."""
     values = asdict(cfg)
+    if values["depth"] == asdict(DepthCfg()):
+        del values["depth"]
     for key in STAIRS_OPTIONS:
         if values[key] == getattr(LocoCfg, key):
             del values[key]

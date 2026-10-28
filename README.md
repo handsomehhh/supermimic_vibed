@@ -94,6 +94,36 @@ python tools/test_env.py --packs data/packs/lafan_loco.pt     # FK vs simulator,
 
 ## Usage
 
+### Depth-camera student
+
+`train_student.py --observation depth` selects a terrain-only depth camera and CNN student;
+the default remains `--observation map`. Depth and elevation observations can also be enabled
+independently in `LocoCfg`. Resume, PPO fine-tuning and evaluation retain the checkpoint's sensor
+configuration. The student uses measured proprioception history and its selected sensor only.
+
+```bash
+python supermimic/train_student.py --teacher logs/p25_stairs_smoke/last.pt \
+  --observation depth --num_envs 256 --iterations 6 --log_dir logs/depth_smoke
+python supermimic/eval_loco.py --ckpt logs/depth_smoke/last.pt --trials 1
+python tools/export_student.py --ckpt logs/depth_smoke/last.pt --out logs/depth_smoke/export
+python tools/test_depth_camera.py --out logs/depth_checks
+```
+
+Defaults: 32×24 pixels, 87° horizontal FOV, torso-mounted at the G1 D435 position, −50° pitch,
+0.1–3 m axial depth, 30 Hz refresh, and 0–60 ms episode latency. Torch GPU ray marching uses
+10 cm coarse steps and six bisections of the first crossing. Robot self-occlusion is ignored;
+features narrower than a coarse interval may be missed. Noise includes sigma `0.005 * depth²`
+meters, 2–5% pixel holes, 30% dropout at depth edges, and ±1 cm / ±1° extrinsic error.
+
+`--depth_config camera.json` overrides `DepthCfg` for new runs (`resolution` is `[width,height]`).
+`--depth_noise off` bypasses noise, refresh and latency for diagnostics, as with the map sensor.
+The first CUDA use compiles the renderer. Export includes TorchScript, ONNX, and `student_spec.json`
+with camera intrinsics, extrinsics, timing and input layout: oldest-to-newest history, then all
+depths and all validity bits, image rows top-to-bottom and columns left-to-right. Invalid depth
+is zero with validity zero; only proprioception is normalized inside the exported model.
+
+### Motion tracking
+
 ```bash
 # motion tracking + velocity interface on 8 GPUs
 NGPU=8 ./run_train.sh loco --motion_packs data/packs/lafan_loco.pt --loco_packs data/packs/lafan_loco.pt

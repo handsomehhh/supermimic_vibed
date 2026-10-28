@@ -16,13 +16,14 @@ from onnx.reference import ReferenceEvaluator
 from tensordict import TensorDict
 
 from supermimic.elevation_map import ElevationCfg
+from supermimic.depth_camera import DepthCfg
 from supermimic.robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list, sim_model
 from supermimic.student import is_student, load_student
 
 
 def specification(ck, actor):
     cfg = ck["env_cfg"]
-    elevation = ElevationCfg(**cfg["elevation"])
+    elevation = ElevationCfg(**cfg.get("elevation", {}))
     nx, ny = elevation.shape
     history = cfg["history_length"]
     fields = [("angular_velocity", 0, 3, "rad/s", "base/body frame"),
@@ -32,7 +33,7 @@ def specification(ck, actor):
               ("joint_velocity", 38, 67, "rad/s", "joint coordinates"),
               ("previous_action", 67, 96, "dimensionless", "previous applied action after [-10,10] clamp")]
     model = sim_model(collision=cfg["collision"])
-    return {"format_version": 1, "checkpoint": ck.get("iter"), "control_rate_hz": 50, "control_dt_s": .02,
+    spec = {"format_version": 1, "checkpoint": ck.get("iter"), "control_rate_hz": 50, "control_dt_s": .02,
             "input": {"name": "observations", "dtype": "float32", "shape": ["batch", actor.obs_dim],
                       "order": ["policy_history", "map_heights", "map_validity"],
                       "history": {"length": history, "frame_size": 96, "order": "oldest to newest, flattened frame-major",
@@ -62,6 +63,29 @@ def specification(ck, actor):
                        "joint_upper_rad": model.jnt_range[1:, 1].tolist(),
                        "target_formula": "clip(default + scale * clip(action,-10,10), joint_lower, joint_upper)",
                        "control": "PD joint targets held for four 5 ms simulation substeps; deploy at 50 Hz"}}
+    if actor.sensor_key == "depth_image":
+        depth = DepthCfg(**cfg["depth"])
+        h, w = depth.shape
+        spec["format_version"] = 2
+        spec["input"]["order"] = ["policy_history", "depth_meters", "depth_validity"]
+        del spec["input"]["map"]
+        spec["input"]["depth"] = {
+            "depth_slice": [history * 96, history * 96 + h * w],
+            "validity_slice": [history * 96 + h * w, actor.obs_dim], "shape_hw": [h, w],
+            "flatten_order": "row-major, top to bottom, left to right; all depths then all masks",
+            "depth_units": "m", "depth_formula": "axial distance along optical forward (+x before pitch), not Euclidean range",
+            "horizontal_fov_degrees": depth.horizontal_fov_degrees, "square_pixels": True,
+            "pixel_centers": "u+0.5, v+0.5; principal point=(width/2,height/2)",
+            "axes_before_pitch": "forward=link +x, image right=-y, image down=-z",
+            "mount_link": depth.mount_link, "mount_position_m": list(depth.mount_position),
+            "pitch_degrees": depth.pitch_degrees, "pitch_convention": "optical axis elevation, negative looks down",
+            "clip_m": [depth.near, depth.far], "validity": "1=valid, 0=invalid", "invalid_depth": depth.neutral,
+            "timing": "hold complete acquisition-frame image between refreshes; no motion compensation",
+            "startup": "seed pose ring with current link pose; no data from prior episode",
+            "rendering": "terrain only; robot self-occlusion ignored", "training_noise": asdict(depth)}
+        spec["normalization"].update(formula="history: (x - mean) / (std + 0.01); depth: identity",
+                                     applies_to="proprioceptive history only; depth remains meters, mask remains 0/1; do not normalize externally")
+    return spec
 
 
 def export(checkpoint, out):
@@ -90,8 +114,9 @@ def export(checkpoint, out):
             cells = actor.map_dim // 2
             mask = torch.randint(0, 2, (batch, cells)).float()
             x[:, -cells:] = mask
-            x[:, actor.history_dim:actor.history_dim + cells].masked_fill_(mask == 0, ck["env_cfg"]["elevation"]["neutral"])
-            obs = TensorDict({"policy_history": x[:, :actor.history_dim], "elevation_map": x[:, actor.history_dim:]}, [batch])
+            sensor = "depth" if actor.sensor_key == "depth_image" else "elevation"
+            x[:, actor.history_dim:actor.history_dim + cells].masked_fill_(mask == 0, ck["env_cfg"][sensor]["neutral"])
+            obs = TensorDict({"policy_history": x[:, :actor.history_dim], actor.sensor_key: x[:, actor.history_dim:]}, [batch])
             expected = actor(obs)
             jit = scripted(x)
             onnx_out = reference.run(None, {"observations": x.numpy()})[0]

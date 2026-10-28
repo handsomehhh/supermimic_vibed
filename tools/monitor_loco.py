@@ -24,7 +24,7 @@ def read_rows(path):
             continue
         parsed = {}
         for key, value in row.items():
-            if key in ("terrain", "map_noise", "checkpoint", "policy_type"):
+            if key in ("terrain", "map_noise", "depth_noise", "checkpoint", "policy_type"):
                 parsed[key] = value
                 continue
             try:
@@ -76,7 +76,7 @@ def assess(run, args, now=None):
         levels = [(r["iteration"], r["terrain_level"]) for r in train if "terrain_level" in r]
         groups = {}
         for row in evaluation:
-            if row.get("map_noise", "on") != args.eval_map_noise or not {"iteration", "success"} <= row.keys():
+            if row.get("depth_noise", row.get("map_noise", "on")) != args.eval_map_noise or not {"iteration", "success"} <= row.keys():
                 continue
             group = groups.setdefault(row["iteration"], {})
             # Last row wins if a writer accidentally duplicated a terrain/level.
@@ -123,7 +123,7 @@ def parser():
     p.add_argument("--level_delta", type=float, default=.01)
     p.add_argument("--success_delta", type=float, default=.01)
     p.add_argument("--eval_max_lag", type=int, default=1000)
-    p.add_argument("--eval_map_noise", choices=("on", "off"), default="on")
+    p.add_argument("--eval_map_noise", "--eval_depth_noise", choices=("on", "off"), default="on")
     p.add_argument("--max_hours", type=float, default=24, help="0 disables")
     return p
 

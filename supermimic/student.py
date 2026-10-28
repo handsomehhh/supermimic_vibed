@@ -1,4 +1,4 @@
-"""Deployable student model: measured proprioception history and onboard map only."""
+"""Deployable student: measured proprioception history and onboard map or depth."""
 from copy import deepcopy
 
 import torch
@@ -41,13 +41,34 @@ class ConvMapEncoder(nn.Module):
         return self.layers(x.reshape(-1, 2, self.nx, self.ny)).reshape(shape)
 
 
+class ConvDepthEncoder(nn.Module):
+    def __init__(self, shape, latent):
+        super().__init__()
+        self.height, self.width = shape
+        self.latent = latent
+        self.layers = nn.Sequential(
+            nn.Conv2d(2, 16, 5, stride=2, padding=2), nn.ELU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ELU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ELU(), nn.Flatten(),
+            nn.Linear(32 * ((self.height + 3) // 4) * ((self.width + 3) // 4), latent), nn.ELU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = list(x.shape)
+        shape[-1] = self.latent
+        return self.layers(x.reshape(-1, 2, self.height, self.width)).reshape(shape)
+
+
 class StudentModel(MLPModel):
     def __init__(self, obs, obs_groups, obs_set, output_dim, map_latent=64,
-                 map_encoder="mlp", map_shape=None, **kwargs):
-        if obs_groups[obs_set] != ["policy_history", "elevation_map"]:
-            raise ValueError("Student inputs must be policy_history, elevation_map in that order")
+                 map_encoder="mlp", map_shape=None, depth_shape=None, **kwargs):
+        groups = obs_groups[obs_set]
+        if groups not in (["policy_history", "elevation_map"], ["policy_history", "depth_image"]):
+            raise ValueError("Student inputs must be policy_history then elevation_map or depth_image")
+        self.sensor_key = groups[1]
+        if self.sensor_key == "depth_image":
+            map_encoder, map_shape = "cnn", depth_shape
         self.history_dim = obs["policy_history"].shape[-1]
-        self.map_dim = obs["elevation_map"].shape[-1]
+        self.map_dim = obs[self.sensor_key].shape[-1]
         self.map_latent = map_latent
         self.map_encoder_type = map_encoder
         if map_encoder not in ("mlp", "cnn"):
@@ -57,11 +78,13 @@ class StudentModel(MLPModel):
         if map_encoder == "cnn" and (map_shape is None or len(map_shape) != 2 or
                                      any(not isinstance(n, int) or n < 1 for n in map_shape) or
                                      2 * map_shape[0] * map_shape[1] != self.map_dim):
-            raise ValueError("CNN map_shape must be (nx, ny) with 2 * nx * ny == elevation_map size")
+            raise ValueError("CNN sensor shape must have two positive dimensions with 2 * product == observation size")
         super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
         if self.obs_normalization:
             self.obs_normalizer = StudentNormalization(self.obs_dim, self.history_dim)
-        if map_encoder == "cnn":
+        if self.sensor_key == "depth_image":
+            self.map_encoder = ConvDepthEncoder(map_shape, map_latent)
+        elif map_encoder == "cnn":
             self.map_encoder = ConvMapEncoder(map_shape, map_latent)
         else:
             self.map_encoder = nn.Sequential(nn.Linear(self.map_dim, 128), nn.ELU(),
@@ -82,7 +105,7 @@ class StudentModel(MLPModel):
 
 
 class ExportStudent(nn.Module):
-    """Stateless interface: caller maintains history and map refreshes."""
+    """Stateless interface: caller maintains history and sensor refreshes."""
     def __init__(self, actor):
         super().__init__()
         self.history_dim = actor.history_dim
@@ -112,19 +135,28 @@ def is_student(ck):
     return ck.get("runner_cfg", {}).get("policy_type") == "student"
 
 
+def student_inputs(ck):
+    name = "student" if "student_state_dict" in ck else "actor"
+    return ck["runner_cfg"].get("obs_groups", {}).get(name, ["policy_history", "elevation_map"])
+
+
 def load_student(ck, device="cpu"):
     """Load just the actor, without physics, teacher, optimizer or GPU allocation."""
     cfg = ck["env_cfg"]
     from .elevation_map import ElevationCfg
-    shape = ElevationCfg(**cfg["elevation"]).shape
+    from .depth_camera import DepthCfg
+    groups = student_inputs(ck)
+    depth = groups == ["policy_history", "depth_image"]
+    shape = DepthCfg(**cfg["depth"]).shape if depth else ElevationCfg(**cfg["elevation"]).shape
     obs = TensorDict({"policy_history": torch.zeros(1, 96 * cfg["history_length"], device=device),
-                      "elevation_map": torch.zeros(1, 2 * shape[0] * shape[1], device=device)}, [1])
+                      groups[1]: torch.zeros(1, 2 * shape[0] * shape[1], device=device)}, [1])
     name = "student" if "student_state_dict" in ck else "actor"
     model_cfg = deepcopy(ck["runner_cfg"][name])
     model_cfg.pop("class_name")
-    if model_cfg.get("map_encoder", "mlp") == "cnn":
-        if tuple(model_cfg.setdefault("map_shape", shape)) != shape:
-            raise ValueError("Student map_shape does not match checkpoint elevation config")
-    actor = StudentModel(obs, {name: ["policy_history", "elevation_map"]}, name, 29, **model_cfg).to(device)
+    if depth or model_cfg.get("map_encoder", "mlp") == "cnn":
+        key = "depth_shape" if depth else "map_shape"
+        if tuple(model_cfg.setdefault(key, shape)) != shape:
+            raise ValueError("Student sensor shape does not match checkpoint observation config")
+    actor = StudentModel(obs, {name: groups}, name, 29, **model_cfg).to(device)
     actor.load_state_dict(ck[name + "_state_dict"])
     return actor.eval()

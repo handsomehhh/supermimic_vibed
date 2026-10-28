@@ -1,4 +1,4 @@
-"""DAgger distillation and optional asymmetric PPO for the elevation-map student."""
+"""DAgger distillation and optional asymmetric PPO for map/depth students."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ from rsl_rl.runners import DistillationRunner
 
 from supermimic.loco_env import LocoEnv, setup_device
 from supermimic.train_ppo import LocoRunner, cfg_from_dict, runner_config
-from supermimic.student import is_student
+from supermimic.student import is_student, student_inputs
 from supermimic.terrain import TILE_TYPES
 
 
@@ -26,10 +26,10 @@ def student_config():
             "activation": "elu", "obs_normalization": True, "map_latent": 64}
 
 
-def distillation_config(teacher):
+def distillation_config(teacher, observation="map"):
     return {"policy_type": "student", "stage": "distill", "student": student_config(),
             "teacher": deepcopy(teacher["runner_cfg"]["actor"]),
-            "obs_groups": {"student": ["policy_history", "elevation_map"],
+            "obs_groups": {"student": ["policy_history", "depth_image" if observation == "depth" else "elevation_map"],
                            "teacher": deepcopy(teacher["runner_cfg"]["obs_groups"]["actor"])},
             "algorithm": {"class_name": "Distillation", "num_learning_epochs": 2,
                           "gradient_length": 1, "learning_rate": 3e-4, "max_grad_norm": 1., "loss_type": "mse"},
@@ -42,7 +42,7 @@ def finetune_config(student):
     cfg["actor"] = deepcopy(student["runner_cfg"].get("student", student["runner_cfg"].get("actor")))
     cfg["actor"]["distribution_cfg"] = {"class_name": "GaussianDistribution", "init_std": .1, "std_type": "scalar"}
     cfg["critic"] = deepcopy(student.get("teacher_critic_cfg", student["runner_cfg"].get("critic", cfg["critic"])))
-    cfg["obs_groups"]["actor"] = ["policy_history", "elevation_map"]
+    cfg["obs_groups"]["actor"] = deepcopy(student_inputs(student))
     cfg["algorithm"].update(learning_rate=1e-4, entropy_coef=.001)
     return cfg
 
@@ -71,6 +71,9 @@ def main():
     p.add_argument("--num_envs", type=int, default=4096)
     p.add_argument("--iterations", type=int, default=10000)
     p.add_argument("--history_length", type=int, default=5)
+    p.add_argument("--observation", choices=("map", "depth"), default="map", help="Sensor for new distillation runs")
+    p.add_argument("--depth_config", type=Path, help="JSON overrides for DepthCfg (new depth distillation runs)")
+    p.add_argument("--depth_noise", choices=("on", "off"), default="on")
     p.add_argument("--map_config", type=Path, help="JSON overrides for ElevationCfg (new distillation runs)")
     p.add_argument("--map_noise", choices=("on", "off"), default="on")
     p.add_argument("--map_encoder", choices=("mlp", "cnn"), default="mlp", help="Map encoder (new distillation runs)")
@@ -102,20 +105,28 @@ def main():
     elif args.stage == "distill":
         if is_student(ck):
             p.error("--teacher must be a P2 teacher checkpoint")
-        cfg.elevation.enabled, cfg.elevation.noise = True, args.map_noise == "on"
+        cfg.elevation.enabled, cfg.elevation.noise = args.observation == "map", args.map_noise == "on"
+        cfg.depth.enabled, cfg.depth.noise = args.observation == "depth", args.depth_noise == "on"
         cfg.history_length, cfg.seed = args.history_length, args.seed
-        if args.map_config:
+        if args.map_config and args.observation == "map":
             from supermimic.elevation_map import ElevationCfg
             cfg.elevation = ElevationCfg(**{**asdict(cfg.elevation), **json.loads(args.map_config.read_text())})
             cfg.elevation.enabled = True
-        train_cfg = distillation_config(ck)
+        if args.depth_config and args.observation == "depth":
+            from supermimic.depth_camera import DepthCfg
+            cfg.depth = DepthCfg(**{**asdict(cfg.depth), **json.loads(args.depth_config.read_text())})
+            cfg.depth.enabled = True
+        train_cfg = distillation_config(ck, args.observation)
         train_cfg["student"].update(map_encoder=args.map_encoder, hidden_dims=args.hidden_dims, map_latent=args.map_latent)
-        if args.map_encoder == "cnn":
+        if args.observation == "depth":
+            train_cfg["student"].update(map_encoder="cnn", depth_shape=list(cfg.depth.shape))
+        elif args.map_encoder == "cnn":
             train_cfg["student"]["map_shape"] = list(cfg.elevation.shape)
     else:
         if not is_student(ck):
             p.error("--student must be a P3 student checkpoint")
         cfg.elevation.noise = args.map_noise == "on"
+        cfg.depth.noise = args.depth_noise == "on"
         train_cfg = finetune_config(ck)
     if args.terrain_proportions is not None:
         cfg.terrain.proportions = tuple(args.terrain_proportions)
@@ -127,7 +138,9 @@ def main():
     log.mkdir(parents=True, exist_ok=True)
     if not args.resume and any(log.glob("ckpt_*.pt")):
         p.error("Use a new log directory for a new stage, or --resume")
-    (log / "args.json").write_text(json.dumps({**vars(args), "map_config": str(args.map_config) if args.map_config else None,
+    args.map_config = str(args.map_config) if args.map_config else None
+    args.depth_config = str(args.depth_config) if args.depth_config else None
+    (log / "args.json").write_text(json.dumps({**vars(args),
                                              "env_cfg": asdict(cfg), "runner_cfg": train_cfg}, indent=2))
     env = LocoEnv(args.num_envs, cfg, args.device)
     runner = (StudentRunner if args.stage == "distill" else LocoRunner)(env, train_cfg, log, args.device)
@@ -153,7 +166,7 @@ def main():
         env.common_step_counter = ck.get("common_step_counter", 0)
         env.levels.copy_(ck["levels"][env.ids.cpu() % len(ck["levels"])].to(env.device))
         env.reset(env.ids)
-        runner.checkpoint(0, vars(args) | {"map_config": str(args.map_config) if args.map_config else None})
+        runner.checkpoint(0, vars(args))
     runner.train(args.iterations, vars(args), args.save_every, args.log_every)
 
 

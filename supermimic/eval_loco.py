@@ -17,7 +17,7 @@ import torch
 from supermimic.loco_env import LocoEnv, setup_device
 from supermimic.terrain import TILE_TYPES
 from supermimic.train_ppo import LocoRunner, cfg_from_dict
-from supermimic.student import is_student, load_student
+from supermimic.student import is_student, load_student, student_inputs
 
 
 DIRECTION = "legacy"
@@ -37,7 +37,11 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
     cfg = cfg_from_dict(deepcopy(ck["env_cfg"]))
     cfg.curriculum = cfg.randomization = cfg.observation_noise = False
     student = is_student(ck)
+    noise_key = "map_noise"
     if student:
+        if "depth_image" in student_inputs(ck):
+            cfg.depth.noise = map_noise
+            noise_key = "depth_noise"
         cfg.elevation.noise = map_noise
     cfg.episode_seconds = 20
     # Always evaluate all seven P1 types, including checkpoints trained on flat.
@@ -98,19 +102,20 @@ def evaluate(checkpoint: str | Path, trials: int = 8, device: str = "cuda:0", ma
         for k, name in enumerate(TILE_TYPES):
             mask = (levels == level) & (kinds == k)
             records.append({"iteration": ck["iter"], "terrain": name, "level": level, "trials": trials,
-                            **({"map_noise": "on" if map_noise else "off"} if student else {}),
+                            **({noise_key: "on" if map_noise else "off"} if student else {}),
                             "success": float(success[mask].float().mean()), "falls": int(fell[mask].sum()),
                             "tracking_error": float((lin_sum[mask] / samples[mask].clamp(min=1)).mean()),
                             "yaw_error": float((yaw_sum[mask] / samples[mask].clamp(min=1)).mean()),
                             "distance": float(max_distance[mask].mean())})
     return {"checkpoint": str(checkpoint), "iteration": ck["iter"], "seconds": 8, "speed": .6,
-            **({"map_noise": "on" if map_noise else "off", "policy_type": "student"} if student else {}),
+            **({noise_key: "on" if map_noise else "off", "policy_type": "student"} if student else {}),
             "trials": trials, "seed": 0, "success": float(success.float().mean()), "falls": int(fell.sum()),
             "num_envs": env.num_envs, "blowups": int(env.total_blown), "results": records}
 
 
 def write_result(checkpoint: Path, result: dict) -> None:
-    suffix = "_eval" + tag() + ("_noise_" + result["map_noise"] if "map_noise" in result else "") + ".json"
+    noise_key = "depth_noise" if "depth_noise" in result else "map_noise"
+    suffix = "_eval" + tag() + ("_noise_" + result[noise_key] if noise_key in result else "") + ".json"
     destination = checkpoint.with_name(checkpoint.stem + suffix)
     temp = destination.with_suffix(".tmp")
     temp.write_text(json.dumps(result, indent=2))
@@ -121,7 +126,7 @@ def write_result(checkpoint: Path, result: dict) -> None:
     if csv_path.exists():
         with csv_path.open() as f:
             previous = [r for r in csv.DictReader(f) if int(r["iteration"]) != result["iteration"]
-                        or r.get("map_noise") != result.get("map_noise")]
+                        or r.get(noise_key) != result.get(noise_key)]
     temp_csv = csv_path.with_suffix(".tmp")
     with temp_csv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(result["results"][0]))
@@ -138,7 +143,7 @@ def main():
     p.add_argument("--trials", type=int, default=8)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--poll_seconds", type=float, default=30)
-    p.add_argument("--map_noise", choices=("on", "off", "both"), default="on")
+    p.add_argument("--map_noise", "--depth_noise", choices=("on", "off", "both"), default="on")
     p.add_argument("--direction", choices=("legacy", "forward"), default="legacy")
     p.add_argument("--yaw_deg", type=float, default=5.0, help="start heading spread (+/- degrees)")
     p.add_argument("--robust", action="store_true", help="random headings/offsets over every tile of each type")
