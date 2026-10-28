@@ -142,3 +142,11 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   (`scratch_outward_s0`) reaches 0.999 overall / 0.99 ascent at it 12000, matching the fine-tuned teacher.
   Next: PPO fine-tune of the CNN-stairs student (stair-weighted and default terrain), seed replicate, and
   distillation from the from-scratch teacher.
+- 2026-10-28 — **v2 candidate, not yet a v1 replacement.** `student_cnn_h10_stairs` it 4000 exported to
+  `logs/loco/student_cnn_h10_stairs/export_v2/`. Robust L7–9, noisy map: ascent **0.82** (v1 0.67), but descent
+  0.81 (v1 0.98) and boxes 0.94 (v1 0.99); overall 0.980 vs 0.983. Noise off: ascent 0.83, so noise is still not
+  the limit. Stair-weighted distillation shifts skill toward ascent at the cost of descent. The PPO fine-tune of
+  this student does the reverse at it 1000 (ascent 0.49–0.55, descent 0.96–0.99, boxes 0.97): early PPO trades
+  ascent away even with outward commands on. Single robust evals vary by about ±0.07 per bucket (same weights:
+  0.82 and 0.90 in two evals), so decisions need several checkpoints. Queue runner (`tools/gpu_queue.sh`) now
+  refills idle GPUs automatically.
