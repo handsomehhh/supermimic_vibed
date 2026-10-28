@@ -17,6 +17,7 @@ from .elevation_map import ElevationCfg, ElevationMap
 from .robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list, sim_model
 from .rotations import quat_to_mat
 from .terrain import HeightSampler, TILE_TYPES, TerrainCfg, generate
+from .stairs import body_contact_vectors, clearance_cost, nearest_edge_heading, stumble_cost
 
 
 @dataclass
@@ -41,6 +42,18 @@ class LocoCfg:
     scan_size: tuple[float, float] = (1.6, 1.0)
     elevation: ElevationCfg = field(default_factory=ElevationCfg)
     history_length: int = 5
+    # Opt-in P2.5 terms: disabled branches consume no random numbers or observations.
+    foot_clearance_weight: float = 0.0
+    foot_clearance_target: float = 0.10
+    foot_stumble_weight: float = 0.0
+    foot_stumble_ratio: float = 3.0
+    outward_fraction: float = 0.0
+    outward_speed: float = 0.6
+    contact_vectors: bool = False  # diagnostics can request vectors without rewards
+
+
+STAIRS_OPTIONS = ("foot_clearance_weight", "foot_clearance_target", "foot_stumble_weight",
+                  "foot_stumble_ratio", "outward_fraction", "outward_speed", "contact_vectors")
 
 
 def setup_device(device: str) -> None:
@@ -91,6 +104,14 @@ class LocoEnv(VecEnv):
     def __init__(self, num_envs: int = 4096, cfg: LocoCfg | None = None, device: str = "cuda:0",
                  eval_mode: bool = False):
         self.cfg = cfg or LocoCfg()
+        if not np.isfinite([getattr(self.cfg, k) for k in STAIRS_OPTIONS]).all():
+            raise ValueError("Stair options must be finite")
+        if not 0 <= self.cfg.outward_fraction <= 1:
+            raise ValueError("outward_fraction must be in [0, 1]")
+        if min(self.cfg.foot_clearance_target, self.cfg.foot_stumble_ratio, self.cfg.outward_speed) <= 0:
+            raise ValueError("Clearance target, stumble ratio and outward speed must be positive")
+        if max(self.cfg.foot_clearance_weight, self.cfg.foot_stumble_weight) > 0:
+            raise ValueError("Clearance and stumble weights must be nonpositive costs")
         self.device, self.num_envs, self.eval_mode = device, num_envs, eval_mode
         self.common_step_counter = 0
         self.max_episode_length = round(self.cfg.episode_seconds / self.dt)
@@ -117,12 +138,24 @@ class LocoEnv(VecEnv):
         self.feet = torch.tensor([m.body(s + "_ankle_roll_link").id for s in ("left", "right")], device=device)
         self.nonfeet = torch.ones(m.nbody, device=device, dtype=torch.bool)
         self.nonfeet[0], self.nonfeet[self.feet] = False, False
+        self._vector_contacts = self.cfg.contact_vectors or self.cfg.foot_stumble_weight != 0
+        if self.cfg.foot_clearance_weight or self.cfg.contact_vectors:
+            # Both collision modes use spherical sole pads. Probe their actual lower
+            # surfaces, including the toe, instead of treating ankle height as clearance.
+            pads = [np.flatnonzero((m.geom_bodyid == b) & (m.geom_contype != 0)
+                                  & (m.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE)) for b in self.feet.tolist()]
+            if not len(pads[0]) or len(pads[0]) != len(pads[1]):
+                raise ValueError("Stair clearance requires matching spherical sole pads on both feet")
+            self.foot_pad_ids = torch.tensor(np.stack(pads), device=device)
+            self.foot_pad_radius = torch.tensor(m.geom_size[np.stack(pads), 0], device=device, dtype=torch.float32)
         self.hips = [i for i, n in enumerate(G1_JOINT_NAMES) if "hip_roll" in n or "hip_yaw" in n]
         self.arms = list(range(15, 29))
         with wp.ScopedDevice(device):
             self.model = mjw.put_model(m)
             self.data = mjw.make_data(m, nworld=num_envs, nconmax=128, nccdmax=32, njmax=1000)
             self._normal = wp.zeros((num_envs, m.nbody), dtype=float)
+            if self._vector_contacts:
+                self._force_vector = wp.zeros((num_envs, m.nbody, 3), dtype=float)
             self._reset_mask = wp.zeros(num_envs, dtype=bool)
             friction = _expand_model(self.model, "geom_friction", num_envs)
             ipos = _expand_model(self.model, "body_ipos", num_envs)
@@ -135,6 +168,8 @@ class LocoEnv(VecEnv):
             _expand_model(self.model.stat, "meaninertia", num_envs)
         self.qpos, self.qvel, self.ctrl = [wp.to_torch(a) for a in (self.data.qpos, self.data.qvel, self.data.ctrl)]
         self.body_force = wp.to_torch(self._normal)
+        if self._vector_contacts:
+            self.body_force_vector = wp.to_torch(self._force_vector)
         self.friction = torch.ones(num_envs, device=device)
         if self.cfg.randomization and not eval_mode:
             self.friction.uniform_(0.8, 1.2)
@@ -154,6 +189,9 @@ class LocoEnv(VecEnv):
         self.heading = torch.zeros(num_envs, device=device)
         self.heading_mode = torch.zeros(num_envs, device=device, dtype=torch.bool)
         self.standing = self.heading_mode.clone()
+        if self.cfg.outward_fraction:
+            self.outward_mode = self.heading_mode.clone()
+            self.outward_velocity = torch.zeros(num_envs, device=device)
         self.command_left = self.episode_length_buf.clone()
         self.push_left = self.episode_length_buf.clone()
         self.start_xy = torch.zeros(num_envs, 2, device=device)
@@ -175,12 +213,18 @@ class LocoEnv(VecEnv):
         self.reset(self.ids)
         with wp.ScopedDevice(device), wp.ScopedCapture() as cap:
             self._normal.zero_()
+            if self._vector_contacts:
+                self._force_vector.zero_()
             for _ in range(4):
                 mjw.step(self.model, self.data)
                 c = self.data.contact
                 wp.launch(_body_contacts, dim=self.data.naconmax,
                           inputs=[self.data.nacon, c.worldid, c.geom, c.efc_address, self.data.efc.force,
                                   self.model.geom_bodyid, self._normal])
+                if self._vector_contacts:
+                    wp.launch(body_contact_vectors, dim=self.data.naconmax,
+                              inputs=[self.data.nacon, c.worldid, c.geom, c.efc_address, self.data.efc.force,
+                                      self.model.geom_bodyid, c.frame, c.friction, self._force_vector])
             # mjw.step leaves kinematics at the beginning of the final substep.
             mjw.kinematics(self.model, self.data)
         self.step_graph = cap.graph
@@ -216,6 +260,17 @@ class LocoEnv(VecEnv):
         self.heading_mode[forward] = False
         self.standing[ids] = torch.rand(n, device=self.device) < self.cfg.standing_fraction
         self.command_left[ids] = torch.empty(n, device=self.device).uniform_(*self.cfg.command_seconds).div(self.dt).long()
+        if self.cfg.outward_fraction:
+            pyramid = (self.kinds[ids] >= 2) & (self.kinds[ids] <= 5)
+            self.outward_mode[ids] = pyramid & (torch.rand(n, device=self.device) < self.cfg.outward_fraction)
+            selected = ids[self.outward_mode[ids]]
+            R = quat_to_mat(self.qpos[selected, 3:7])
+            yaw = torch.atan2(R[:, 1, 0], R[:, 0, 0])
+            self.heading[selected] = nearest_edge_heading(
+                self.qpos[selected, :2], self.origins[self.levels[selected], self.columns[selected], :2],
+                self.qpos.new_tensor(self.cfg.terrain.tile_size) / 2, yaw)
+            self.heading_mode[selected], self.standing[selected] = True, False
+            self.outward_velocity[selected] = self.cfg.outward_speed * (scale if self.cfg.command_curriculum else 1.)
         self._heading_commands()
 
     def _heading_commands(self) -> None:
@@ -223,6 +278,10 @@ class LocoEnv(VecEnv):
         error = self.heading - torch.atan2(R[:, 1, 0], R[:, 0, 0])
         rate = (0.5 * torch.atan2(error.sin(), error.cos())).clamp(*self.cfg.command_yaw)
         self.cmd[:, 2] = torch.where(self.heading_mode, rate, self.cmd[:, 2])
+        if self.cfg.outward_fraction:
+            # Turn toward the edge before translating; body-frame vy stays zero.
+            self.cmd[self.outward_mode, 0] = (self.outward_velocity * error.cos().clamp(min=0))[self.outward_mode]
+            self.cmd[self.outward_mode, 1] = 0
         self.cmd[self.standing] = 0
 
     def update_curriculum(self, ids: torch.Tensor) -> None:
@@ -256,6 +315,11 @@ class LocoEnv(VecEnv):
         self.push_left[ids] = torch.randint(250, 750, (len(ids),), device=self.device)
         if not self.eval_mode:
             self.resample_commands(ids)
+            if self.cfg.outward_fraction:
+                selected = ids[self.outward_mode[ids]]
+                angle = self.heading[selected] / 2
+                self.qpos[selected, 3], self.qpos[selected, 6] = angle.cos(), angle.sin()
+                self._heading_commands()
         if self.elevation is not None:
             self.elevation.reset(ids)
             self.history_stamp[ids] = -1
@@ -266,6 +330,13 @@ class LocoEnv(VecEnv):
         gravity = -R[:, 2, :]
         height = self.qpos[:, 2] - self.sampler.sample(self.qpos[:, :2])
         return R, vel, gravity, height
+
+    def foot_clearance(self):
+        """World sole-pad bottoms, terrain under each pad, and minimum per-foot gap."""
+        points = wp.to_torch(self.data.geom_xpos)[:, self.foot_pad_ids].clone()
+        points[..., 2] -= self.foot_pad_radius
+        terrain = self.sampler.sample(points[..., :2])
+        return points, terrain, (points[..., 2] - terrain).amin(-1)
 
     def get_observations(self) -> TensorDict:
         R, vel, gravity, _ = self._state()
@@ -345,6 +416,13 @@ class LocoEnv(VecEnv):
             "waist_deviation": -.1 * dq[:, 12:15].abs().sum(-1),
             "termination": -10.0 * fall.float(),
         }
+        if self.cfg.foot_clearance_weight:
+            _, _, clearance = self.foot_clearance()
+            terms["foot_clearance"] = self.cfg.foot_clearance_weight * clearance_cost(
+                clearance, foot_speed[..., :2], contact, self.cmd, self.cfg.foot_clearance_target)
+        if self.cfg.foot_stumble_weight:
+            terms["foot_stumble"] = self.cfg.foot_stumble_weight * stumble_cost(
+                self.body_force_vector[:, self.feet], self.cfg.foot_stumble_ratio)
         terms = {k: torch.where(bad, 0, v) for k, v in terms.items()}
         reward = sum(terms.values()) * self.dt
         self.ep_return += reward

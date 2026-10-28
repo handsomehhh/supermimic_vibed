@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import ExitStack
 from copy import deepcopy
 import csv
 from dataclasses import asdict
@@ -21,7 +22,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 
-from supermimic.loco_env import LocoCfg, LocoEnv, setup_device
+from supermimic.loco_env import LocoCfg, LocoEnv, STAIRS_OPTIONS, setup_device
 from supermimic.elevation_map import ElevationCfg
 from supermimic.terrain import TerrainCfg
 
@@ -94,6 +95,45 @@ def cfg_from_dict(values: dict) -> LocoCfg:
     return LocoCfg(**values)
 
 
+def cfg_to_dict(cfg: LocoCfg) -> dict:
+    """Preserve the old serialized config exactly when P2.5 options are defaults."""
+    values = asdict(cfg)
+    for key in STAIRS_OPTIONS:
+        if values[key] == getattr(LocoCfg, key):
+            del values[key]
+    return values
+
+
+def add_stairs_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--preset", choices=("stairs_v1",), help="Opt-in stair fine-tuning; applied after resume config")
+    descriptions = {
+        "foot_clearance_weight": "Swing sole-clearance cost weight (<=0; 0 disables)",
+        "foot_clearance_target": "Target sole clearance above terrain, meters",
+        "foot_stumble_weight": "Foot horizontal-force-ratio cost weight (<=0; 0 disables)",
+        "foot_stumble_ratio": "Stumble when |Fxy| > ratio * |Fz| on either foot",
+        "outward_fraction": "Fraction of stairs/slopes commanded forward toward a nearest tile edge",
+        "outward_speed": "Outward forward speed in m/s, scaled by command curriculum",
+    }
+    for key in STAIRS_OPTIONS:
+        if key == "contact_vectors":
+            parser.add_argument("--contact_vectors", action=argparse.BooleanOptionalAction, default=None)
+        else:
+            parser.add_argument("--" + key, type=float, default=None, help=descriptions[key])
+
+
+def apply_stairs_args(cfg: LocoCfg, args: argparse.Namespace) -> LocoCfg:
+    # G1 MoRE rough config: clearance -0.25 at .10 m, stumble -1 with ratio 3.
+    if args.preset == "stairs_v1":
+        cfg.foot_clearance_weight, cfg.foot_clearance_target = -.25, .10
+        cfg.foot_stumble_weight, cfg.foot_stumble_ratio = -1., 3.
+        cfg.outward_fraction, cfg.outward_speed = .5, .6
+    for key in STAIRS_OPTIONS:
+        value = getattr(args, key)
+        if value is not None:
+            setattr(cfg, key, value)
+    return cfg
+
+
 class LocoRunner(OnPolicyRunner):
     """Small runner loop for CSV/orchestrator compatibility; rsl-rl owns PPO."""
 
@@ -106,7 +146,7 @@ class LocoRunner(OnPolicyRunner):
 
     def checkpoint(self, iteration: int, args: dict) -> None:
         ck = {**self.alg.save(), "iter": iteration, "iteration": iteration, "infos": {},
-              "wall_time": self.wall_time, "args": args, "env_cfg": asdict(self.env.cfg),
+              "wall_time": self.wall_time, "args": args, "env_cfg": cfg_to_dict(self.env.cfg),
               "runner_cfg": self.train_config, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
               "learning_rate": self.alg.learning_rate, "levels": self.env.levels.cpu(),
               "common_step_counter": self.env.common_step_counter,
@@ -149,7 +189,8 @@ class LocoRunner(OnPolicyRunner):
         last_log_time, last_log_it = t0, self.current_learning_iteration
         path = self.log_dir / "train_log.csv"
         exists = path.exists() and path.stat().st_size > 0
-        with path.open("a", newline="") as f:
+        with ExitStack() as files:
+            f = files.enter_context(path.open("a", newline=""))
             writer = None
             for it in range(self.current_learning_iteration, iterations):
                 if (self.log_dir / "STOP").exists():
@@ -187,7 +228,24 @@ class LocoRunner(OnPolicyRunner):
                     if not all(np.isfinite(v) for v in row.values()):
                         raise RuntimeError("Nonfinite training metrics")
                     if writer is None:
-                        writer = csv.DictWriter(f, fieldnames=list(row))
+                        fields = list(row)
+                        if exists:
+                            with path.open(newline="") as previous:
+                                reader = csv.DictReader(previous)
+                                old_fields = reader.fieldnames
+                                if old_fields != fields:
+                                    # Fine-tuning can add/remove reward columns. Keep
+                                    # old metrics and extend the header atomically.
+                                    fields += [k for k in old_fields if k not in row]
+                                    temp = path.with_suffix(".csv.tmp")
+                                    with temp.open("w", newline="") as updated:
+                                        migration = csv.DictWriter(updated, fieldnames=fields)
+                                        migration.writeheader()
+                                        migration.writerows(reader)
+                                    f.close()
+                                    os.replace(temp, path)
+                                    f = files.enter_context(path.open("a", newline=""))
+                        writer = csv.DictWriter(f, fieldnames=fields)
                         if not exists:
                             writer.writeheader()
                     writer.writerow(row)
@@ -217,6 +275,7 @@ def main():
     p.add_argument("--max_init_level", type=int, default=0)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=50)
+    add_stairs_args(p)
     args = p.parse_args()
     setup_device(args.device)
     random.seed(args.seed)
@@ -229,9 +288,10 @@ def main():
     if args.resume:
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
         cfg, train_cfg = cfg_from_dict(ck["env_cfg"]), ck["runner_cfg"]
+    apply_stairs_args(cfg, args)
     log = Path(args.log_dir)
     log.mkdir(parents=True, exist_ok=True)
-    (log / "args.json").write_text(json.dumps({**vars(args), "env_cfg": asdict(cfg), "runner_cfg": train_cfg}, indent=2))
+    (log / "args.json").write_text(json.dumps({**vars(args), "env_cfg": cfg_to_dict(cfg), "runner_cfg": train_cfg}, indent=2))
     env = LocoEnv(args.num_envs, cfg, args.device)
     runner = LocoRunner(env, train_cfg, args.log_dir, args.device)
     if args.resume:
