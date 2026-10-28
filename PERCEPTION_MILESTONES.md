@@ -97,4 +97,22 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   - `HeightSampler.sample` turned NaN query points (foot positions of a blown-up world, read before the rollback)
     into out-of-range indices → device-side assert in the stairs preset after ~1500 iterations (`3ebd56e`).
 - 2026-10-28 — `student_full_s1` converged (legacy success 0.934 at 5.7k iterations) → PPO fine-tune started.
+- 2026-10-28 — **Evaluation noise**: with one fixed tile and near-identical ±5° headings per cell (deterministic
+  rollouts), per-cell success swung by ±0.2 between eval variants (±5° vs ±30° even reversed the ranking). Added
+  `eval_loco --robust` (random ±30° headings, ±0.25 m start offsets, every tile of the type; 32 trials per cell,
+  96 per hard cell) and report Wilson 95% intervals.
+- 2026-10-28 — **P2.5 result (robust eval, forward, ±30°)** — stair ascent at levels 7–9 (17–20 cm):
+
+  | Teacher | overall | ascend L7–9 (95% CI) | descend L7–9 | boxes L7–9 |
+  |---|---|---|---|---|
+  | source full_init4_s0 it 16717 | 0.992 | 0.917 (0.84–0.96) | 0.927 | 1.000 |
+  | control: +3400 it, no change | 0.984 | **0.750 (0.65–0.83)** | 0.990 | 0.948 |
+  | `stairs_v1` preset | 0.998 | 0.958 (0.90–0.98) | 1.000 | 1.000 |
+  | **outward-forward commands only** | **1.000** | **0.990 (0.94–1.00)** | 1.000 | 1.000 |
+  | second teacher + `stairs_v1` | 1.000 | 0.990 (0.94–1.00) | 1.000 | 1.000 |
+
+  **Command shaping is what fixes stair ascent**; foot clearance / stumble rewards add nothing on top. Continued
+  training with the original command mix *degrades* ascent (0.92 → 0.75): sideways/backward/turning commands
+  dominate and forward climbing is rarely practiced. New best teacher: `ft_i4s0_outward`. Control stopped;
+  10-frame-history student distillation from it started.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
