@@ -65,5 +65,21 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   Slopes, boxes, rough ground and stair descent are solved; the **student is insensitive to realistic map noise**
   and within ~0.02 of the teacher. Open gap: **ascending steps above ~15 cm** (levels 7–9, 17–20 cm).
 - 2026-10-28 — P2.5 (stair ascent: foot clearance / stumble terms, outward-forward commands on stair tiles)
-  delegated to Codex.
+  delegated to Codex (first launch hung on stdin; relaunched with `< /dev/null`).
+- 2026-10-28 — **Teachers converged** (monitor plateau stop at 11.5–14k iterations, mean level ~5.9). Longer
+  training fixed much of the stair gap — forward success (all levels / levels 7–9):
+
+  | Teacher | overall | stairs ascend | stairs descend | boxes |
+  |---|---|---|---|---|
+  | full_init4_s1 it 12651 | **0.982** | **0.88 / 0.67** | 1.0 / 1.0 | 1.0 / 1.0 |
+  | full_s1 it 11985 | 0.979 | 0.90 / 0.67 | 0.95 / 0.83 | 1.0 / 1.0 |
+  | full_s0 it 12052 | 0.977 | 0.85 / 0.54 | 1.0 / 1.0 | 0.99 / 0.96 |
+  | full_s3 it 11557 | 0.975 | 0.89 / 0.62 | 0.94 / 0.79 | 1.0 / 1.0 |
+  | full_s4 it 12392 | 0.971 | 0.80 / 0.42 | 1.0 / 1.0 | 1.0 / 1.0 |
+  | full_s2 it 13964 | 0.911 | 0.70 / 0.46 | 0.90 / 0.75 | 1.0 / 1.0 |
+
+  Student `student_s4` (distilled from the *early* it-3158 teacher) converged at 0.93 forward success, stair
+  ascent 0.62 / 0.08 — it inherits its teacher's early weakness. New students are distilled from the final
+  teachers (full_s3, full_s0, full_s1, and full_init4_s1 x {seed 42, seed 1, 10-frame history}); a PPO
+  fine-tune of `student_s4` with the privileged critic runs alongside.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
