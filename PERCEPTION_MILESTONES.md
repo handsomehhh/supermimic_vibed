@@ -115,4 +115,11 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   training with the original command mix *degrades* ascent (0.92 → 0.75): sideways/backward/turning commands
   dominate and forward climbing is rarely practiced. New best teacher: `ft_i4s0_outward`. Control stopped;
   10-frame-history student distillation from it started.
+- 2026-10-28 — **First deployable artifact (v0)**: `student_s4_ppo` it 8223 (distilled from the early it-3158
+  teacher, then PPO fine-tuned with the privileged critic), exported to `logs/loco/student_s4_ppo/export/`
+  (`student.ts`, `student.onnx`, `student_spec.json`). Robust eval (forward, ±30°, 32 trials, noisy map):
+  **0.960** overall; flat/rough/slopes/stair descent 1.00 at every level, boxes 0.99 (0.96 at L7–9),
+  **stair ascent 0.73 (0.17 at L7–9)** — inherits the early teacher's weakness; clean vs noisy map within 0.01.
+  Students from the outward-command teachers (`student_outward_h10`, `student_i4s1stairs_h10`) should close it;
+  a from-scratch teacher with outward commands (`scratch_outward_s0`) checks the fix without fine-tuning.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
