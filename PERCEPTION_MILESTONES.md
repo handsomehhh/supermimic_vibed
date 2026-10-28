@@ -133,3 +133,12 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   clean-map student (upper bound) and a PPO replicate (seed 1). From-scratch outward teacher at 6000 iterations:
   robust 0.983, ascent L7–9 0.885 (still improving) — confirms the command fix without fine-tuning.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
+- 2026-10-28 — **Student capacity is the stair bottleneck (P4).** Distillation from the same outward teacher, robust eval,
+  stair ascent L7–9 (overall in brackets): CNN map encoder + MLP [512,256,128] on stair-weighted terrain (30% ascent
+  tiles) **0.82** at it 4000 (0.980); CNN on default terrain 0.78 at it 5000 (0.984); wide MLP only 0.68 peak, noisy
+  (0.48–0.68); 20-frame history no better (0.22–0.58); clean-map student 0.58 (confirms noise is not the limit).
+  Baseline MLP [256,128] students: 0.43–0.65. The spatial map encoder matters more than width or history.
+  PPO fine-tune of the v1 recipe, seed 1: 0.77 at it 7000 (overall 0.988). From-scratch outward teacher
+  (`scratch_outward_s0`) reaches 0.999 overall / 0.99 ascent at it 12000, matching the fine-tuned teacher.
+  Next: PPO fine-tune of the CNN-stairs student (stair-weighted and default terrain), seed replicate, and
+  distillation from the from-scratch teacher.
