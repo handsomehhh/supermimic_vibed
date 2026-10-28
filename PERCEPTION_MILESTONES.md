@@ -150,3 +150,13 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   ascent away even with outward commands on. Single robust evals vary by about ±0.07 per bucket (same weights:
   0.82 and 0.90 in two evals), so decisions need several checkpoints. Queue runner (`tools/gpu_queue.sh`) now
   refills idle GPUs automatically.
+- 2026-10-28 — **Deployable v2: the teacher was the missing piece.** Same CNN-stairs student recipe (CNN map encoder,
+  MLP [512,256,128], 10-frame history, 30% ascent tiles), distilled from the from-scratch outward teacher
+  (`scratch_outward_s0` it 12000) instead of the fine-tuned one: `student_cnn_stairs_scratchT` it 2000 exported to
+  `logs/loco/student_cnn_stairs_scratchT/export_v2/`. Robust L7–9, noisy map: overall **0.996**, ascent **0.96**,
+  descent 0.99, boxes 0.96 (it 1000: 0.991 / ascent 0.97). Noise off: 0.997, ascent 0.94, descent 1.0, boxes 0.99.
+  v1 was 0.983 / ascent 0.67. The fine-tuned teacher (stair fine-tune on top of a flat/rough teacher) scores the
+  same as this teacher itself, but its behaviour distils worse; a teacher trained with outward commands from the
+  start gives a student that keeps both ascent and descent. Replicates queued (seed 1; second from-scratch
+  teacher). Also seen: a student distilled on a clean map collapses on the noisy map (0.0), and a 20-frame
+  history is unstable (0.83–0.97).
