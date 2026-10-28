@@ -61,7 +61,8 @@ def assess(run, args, now=None):
         # Include time since the last log flush, to catch stalled training runs.
         hours = (logged_seconds + max(0, now - (run / "train_log.csv").stat().st_mtime)) / 3600
         cutoff = iteration - args.blowup_window
-        blowups, prior = 0, 0
+        # sim_blowups is cumulative and resumes from the checkpoint: the first logged row is the baseline
+        blowups, prior = 0, train[0].get("sim_blowups", 0)
         for row in train:
             current = row.get("sim_blowups", prior)
             if row["iteration"] > cutoff:
