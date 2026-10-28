@@ -21,8 +21,15 @@ if ! flock -n 9; then
   flock -w 120 9 || { echo "$(date -u +%FT%TZ) previous send did not exit, skip" >> "$LOG"; exit 0; }
 fi
 idle=$(( ($(date +%s) - $(stat -c %Y "$TRANSCRIPT")) / 60 ))
-if [ "$idle" -lt "$IDLE_MINUTES" ] && ! [ -n "$old" ]; then
-  echo "$(date -u +%FT%TZ) turn in progress (idle ${idle} min), skip" >> "$LOG"
+# a turn in progress: wait (up to 50 min) for it to end instead of skipping the hour
+for _ in $(seq 50); do
+  { [ "$idle" -ge "$IDLE_MINUTES" ] || [ -n "$old" ]; } && break
+  [ "$_" = 1 ] && echo "$(date -u +%FT%TZ) turn in progress (idle ${idle} min), waiting" >> "$LOG"
+  sleep 60
+  idle=$(( ($(date +%s) - $(stat -c %Y "$TRANSCRIPT")) / 60 ))
+done
+if [ "$idle" -lt "$IDLE_MINUTES" ] && [ -z "$old" ]; then
+  echo "$(date -u +%FT%TZ) session busy all hour, skip" >> "$LOG"
   exit 0
 fi
 echo "$(date -u +%FT%TZ) sending prompt (idle ${idle} min)" >> "$LOG"
