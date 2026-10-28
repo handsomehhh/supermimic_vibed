@@ -7,6 +7,8 @@ IDLE_MINUTES=3
 LOG=/home/lxz/supermimic_vibed/logs/hourly_nudge.log
 PROMPT="报告当前进度，如果发生停滞，请你继续本轮任务"
 export PATH=/home/lxz/.nvm/versions/node/v24.14.0/bin:/usr/local/bin:/usr/bin:/bin
+# cron has no proxy settings; without them the API returns 403
+[ -f /home/lxz/.config/hourly_nudge.env ] && . /home/lxz/.config/hourly_nudge.env
 
 mkdir -p "$(dirname "$LOG")"
 exec 9>/tmp/hourly_nudge.lock
