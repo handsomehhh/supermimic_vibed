@@ -52,7 +52,8 @@ def assess(run, args, now=None):
     train, train_errors = read_rows(run / "train_log.csv")
     evaluation, eval_errors = read_rows(run / "eval_loco.csv")
     reasons = train_errors + eval_errors
-    train = sorted((r for r in train if "iteration" in r), key=lambda r: r["iteration"])
+    # a resume from an older checkpoint rewrites iterations: keep the latest row written for each iteration
+    train = sorted({r["iteration"]: r for r in train if "iteration" in r}.values(), key=lambda r: r["iteration"])
     result = {"run": str(run), "iteration": 0, "status": "waiting", "reasons": reasons}
     if train:
         latest = train[-1]
@@ -66,7 +67,7 @@ def assess(run, args, now=None):
         for row in train:
             current = row.get("sim_blowups", prior)
             if row["iteration"] > cutoff:
-                blowups += max(0, current - prior) if current >= prior else current
+                blowups += max(0, current - prior)  # a decrease is a restart from a checkpoint, not new blow-ups
             prior = current
         if args.max_blowups > 0 and blowups >= args.max_blowups:
             reasons.append(f"blowups {blowups:g} >= {args.max_blowups} in last {args.blowup_window} iterations")
