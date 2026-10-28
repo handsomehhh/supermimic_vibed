@@ -82,4 +82,12 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   ascent 0.62 / 0.08 — it inherits its teacher's early weakness. New students are distilled from the final
   teachers (full_s3, full_s0, full_s1, and full_init4_s1 x {seed 42, seed 1, 10-frame history}); a PPO
   fine-tune of `student_s4` with the privileged critic runs alongside.
+- 2026-10-28 — Best teacher: **full_init4_s0 it 16717, forward success 0.984**. Students at ~3300 iterations:
+  legacy success 0.90–0.94; **PPO fine-tune of the student lifts it from 0.87 to 0.94** (`student_s4_ppo`); a
+  10-frame history student (0.934) beats its 5-frame twin (0.911).
+- 2026-10-28 — **P2.5 merged** (`6c77244`, Codex + review): opt-in `--preset stairs_v1` = foot clearance (-0.25,
+  10 cm target, from mjlab MoRE rough) + foot stumble (-1.0) + 50% outward-forward commands on pyramid tiles;
+  `diagnose_stairs.py`. Paired fine-tuning experiment (+5000 iterations each from the best teachers):
+  `ft_i4s0_stairs` (preset), `ft_i4s0_control` (continued training, no preset), `ft_i4s0_outward` (outward
+  commands only), `ft_i4s1_stairs` (preset on the second teacher). Freed GPUs by stopping 4 redundant students.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
