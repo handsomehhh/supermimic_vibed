@@ -90,4 +90,11 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   `diagnose_stairs.py`. Paired fine-tuning experiment (+5000 iterations each from the best teachers):
   `ft_i4s0_stairs` (preset), `ft_i4s0_control` (continued training, no preset), `ft_i4s0_outward` (outward
   commands only), `ft_i4s1_stairs` (preset on the second teacher). Freed GPUs by stopping 4 redundant students.
+- 2026-10-28 — Infra fixes during P2.5 (each cost ≤ 30 min of GPU time):
+  - monitor counted the *cumulative* blow-up counter restored from a checkpoint as recent → stopped resumed runs
+    at once (`dca6eff`); then counted rewritten iterations after a resume-from-older-checkpoint twice
+    (`6ec9bf8`: dedupe by iteration, a decrease is a restart);
+  - `HeightSampler.sample` turned NaN query points (foot positions of a blown-up world, read before the rollback)
+    into out-of-range indices → device-side assert in the stairs preset after ~1500 iterations (`3ebd56e`).
+- 2026-10-28 — `student_full_s1` converged (legacy success 0.934 at 5.7k iterations) → PPO fine-tune started.
 - 2026-10-27 — Started. Local test venv (`/home/lxz/envs/sm_local`, py3.13 + torch 2.9 + mujoco-warp 3.8) so Codex can test GPU code on the local RTX 4090.
