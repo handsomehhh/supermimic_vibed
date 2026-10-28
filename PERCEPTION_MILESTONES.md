@@ -160,3 +160,14 @@ Coding tasks are delegated to local Codex (gpt-6-astra, xhigh); Claude plans, re
   start gives a student that keeps both ascent and descent. Replicates queued (seed 1; second from-scratch
   teacher). Also seen: a student distilled on a clean map collapses on the noisy map (0.0), and a 20-frame
   history is unstable (0.83–0.97).
+- 2026-10-28 — **Depth camera works as well as the elevation map.** Student fed a single forward depth image
+  (32x24, GPU ray-marched from the terrain, D435-like noise; `--observation depth`, CNN encoder, MLP
+  [512,256,128], 10-frame history), distilled from the from-scratch teacher (`scratch_outward_s0` it 12000).
+  Robust L7–9: default terrain mix (`student_depth_scratchT_mix`) it 3000 overall **0.996**, ascent **0.95**,
+  descent 0.99; stair-weighted mix it 2000 0.995 / 0.94 / 0.95 (later checkpoints drift to ascent 0.86). So no
+  elevation-mapping stack is needed for these terrains. Queued: seed 1, PPO fine-tune from it 3000, noise-free
+  depth (upper bound).
+- 2026-10-28 — **v2 recipe replicates.** Map student, seed 1 (`student_cnn_stairs_scratchT_s1`) it 2000: 0.998 /
+  ascent 0.98. From the second from-scratch teacher (`scratch_outward_s1` it 7112): 0.994 / 0.91. Without the CNN
+  (MLP map encoder, same teacher, stairs mix): 0.995 / 0.93 at it 5000 — with a good teacher the CNN matters less.
+  5-frame history: 0.991 / 0.96 at it 4000, unstable after. `tools/play_loco.py` plays any of these locally.
