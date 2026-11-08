@@ -93,7 +93,7 @@ print(f"[record] {C} clips: " + ", ".join(f"{motion.names[i]} ({w})" for i, w in
 
 @torch.no_grad()
 def record_tracking():
-    env = TrackingSim(C, motion, mdp, dev, eval_mode=True)
+    env = TrackingSim(C, motion, mdp, dev, eval_mode=True, self_collision=ra.get("self_collision", False))
     env.reset(torch.arange(C, device=dev), motion.clip_start[cid].clone())
     T = int(min(T_MAX, int(motion.clip_len[cid].max()) - 1))
     rec = {k: [] for k in ("root_p", "root_quat", "q", "ref_root_p", "ref_root_quat", "ref_q", "alive", "t")}
@@ -154,7 +154,7 @@ def record_velocity():
     T = int(sum(s for s, *_ in TOUR) / CONTROL_DT) + 100
     progs = [program(i, T) for i in range(E)]
     cmds = torch.tensor(np.stack([p[0] for p in progs], 1), device=dev)  # (T, E, 3)
-    env = TrackingSim(E, motion, mdp, dev, eval_mode=True, n_vel=E)
+    env = TrackingSim(E, motion, mdp, dev, eval_mode=True, n_vel=E, self_collision=ra.get("self_collision", False))
     longest = motion.clip_start[torch.argmax(torch.where(motion.in_loco, motion.clip_len, 0))]
     env.reset_standing(torch.arange(E, device=dev), longest.expand(E).clone())
     env.cmd_ref[:] = False

@@ -59,6 +59,7 @@ motion = MotionLib.from_packs(run_args["motion_packs"], run_args["loco_packs"], 
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 VEL = len(run_args["loco_packs"]) > 0
 K, Hh = run_args["goal_frames"], run_args["hist"]
+SELF_COL = run_args.get("self_collision", False)  # runs before the flag existed had none
 
 gen = torch.Generator().manual_seed(0)
 
@@ -72,7 +73,7 @@ mo_ids = subset(motion.in_motion, args.max_clips)
 lo_ids = subset(motion.in_loco, args.max_loco_clips) if VEL else torch.zeros(0, dtype=torch.long)
 clip_ids = torch.cat((mo_ids, lo_ids)).to(dev)
 n_mo = len(mo_ids)
-env_m = TrackingSim(len(clip_ids), motion, mdp, dev, eval_mode=True)
+env_m = TrackingSim(len(clip_ids), motion, mdp, dev, eval_mode=True, self_collision=SELF_COL)
 
 
 def step_test_commands():
@@ -89,7 +90,8 @@ def step_test_commands():
 
 if VEL:
     CMDS = step_test_commands().to(dev)
-    env_v = TrackingSim(len(CMDS) * args.trials, motion, mdp, dev, eval_mode=True, n_vel=len(CMDS) * args.trials)
+    env_v = TrackingSim(len(CMDS) * args.trials, motion, mdp, dev, eval_mode=True, n_vel=len(CMDS) * args.trials,
+                        self_collision=SELF_COL)
     longest = motion.clip_start[torch.argmax(torch.where(motion.in_loco, motion.clip_len, 0))]
 
 

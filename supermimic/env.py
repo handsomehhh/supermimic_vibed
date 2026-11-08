@@ -54,7 +54,7 @@ class TrackingSim:
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99, eval_mode: bool = False,
                  max_episode_steps: int = 500, reset_noise: bool = True, n_vel: int = 0, substeps: int = 4, reset_temp: float = 25.0,
-                 ref_cmd_prob: float = 0.5):  # fmt: skip
+                 ref_cmd_prob: float = 0.5, self_collision: bool = False):  # fmt: skip
         self.device = dev = device
         self.N, self.n_vel = num_envs, n_vel
         self.reset_temp = reset_temp  # softmax temperature of return-based reset sampling (paper: 25)
@@ -63,7 +63,7 @@ class TrackingSim:
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
-        self.mjm = mjm = sim_model(CONTROL_DT / substeps)
+        self.mjm = mjm = sim_model(CONTROL_DT / substeps, self_collision=self_collision)
         assert [mjm.joint(i).name for i in range(1, mjm.njnt)] == G1_JOINT_NAMES
         self.wp_device = wp.get_device(dev)
         with wp.ScopedDevice(self.wp_device):

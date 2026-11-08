@@ -56,6 +56,8 @@ parser.add_argument("--rb_snapshot_every", type=int, default=250)
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument("--self_collision", action=argparse.BooleanOptionalAction, default=True,
+                    help="collisions between non-adjacent robot links (exp1-exp4 ran without: --no-self_collision)")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
 
@@ -377,7 +379,8 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp, ref_cmd_prob=args.ref_cmd_prob)
+env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp, ref_cmd_prob=args.ref_cmd_prob,
+                  self_collision=args.self_collision)
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 is_vel = env.is_vel

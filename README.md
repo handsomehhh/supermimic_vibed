@@ -171,8 +171,12 @@ checkpoint and exit; `--resume logs/<run>/last.pt` continues a run.
 
 ## Deviations / choices not specified by the paper
 
-* **Self-collisions disabled** in the simulator (speed); robot–ground contacts use the URDF's
-  convex mesh hulls and foot spheres.
+* **Self-collisions**: exp1-exp4 ran without them (speed). Since then the motion/velocity trainer enables
+  collisions between non-adjacent links by default (`--self_collision`; parent-child and welded links are
+  excluded, the rubber hands have no collision geometry); `--no-self_collision` restores the old setting, and
+  evaluation/recording/playback follow the checkpoint's setting. About 15% of reference frames
+  (play/LAFAN1 sample) interpenetrate, mostly wrist vs hip/torso, up to ~10 cm, so they cannot be tracked exactly.
+  Robot–ground contacts use the URDF's convex mesh hulls and foot spheres.
 * **bf16 autocast for MLP matmuls** (paper: TF32); state integration, FK and rewards stay fp32.
 * Reward, observation and termination heads are **analytic** (allowed by §3.2); termination in
   imagination is a sigmoid-softened version of the hard thresholds.

@@ -119,8 +119,14 @@ def default_joint_pos_list() -> list[float]:
 
 
 def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
-              collision: Literal["mesh", "proxy"] = "mesh") -> mujoco.MjModel:
-    """Free pelvis, position actuators, armature, plane or terrain; no self-collisions."""
+              collision: Literal["mesh", "proxy"] = "mesh", self_collision: bool = False) -> mujoco.MjModel:
+    """Free pelvis, position actuators, armature, plane or terrain.
+
+    Without ``self_collision`` robot geoms touch only the floor. With it, every pair of robot collision
+    geoms on non-adjacent links collides too; parent-child pairs (and links welded together, e.g.
+    pelvis_contour/pelvis, head/torso) stay excluded by MuJoCo's ``filterparent`` rule, which MuJoCo-Warp
+    applies identically. No such pair touches in the default or the zero pose.
+    """
     if collision not in ("mesh", "proxy"):
         raise ValueError(f"Unknown collision mode: {collision}")
     xml = open(MJCF_PATH).read()
@@ -144,6 +150,9 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
         write_hfield(m, terrain)
     robot = m.geom_bodyid > 0
     m.geom_conaffinity[robot] = 0  # robot geoms collide with the floor only
+    if self_collision:
+        m.geom_conaffinity[robot & (m.geom_contype > 0)] = 1  # visual-only geoms (contype 0) stay out
+        assert not m.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_FILTERPARENT
     m.opt.timestep = timestep
     m.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     m.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
