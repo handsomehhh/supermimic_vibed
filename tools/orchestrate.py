@@ -23,6 +23,10 @@ half of its runs do. If more than half of the runs crash, the chain stops; rerun
 resumes unfinished runs from their last.pt. Status: logs/orchestrator.json.
 
   nohup python tools/orchestrate.py > logs/orchestrator.log 2>&1 &
+
+  python tools/orchestrate.py selfcol   exp5 (exp3 + self-collisions), then exp6 (exp4 + self-collisions,
+                                        trained to max_iters); one seed, data parallel on GPUs 6+7,
+                                        redone on GPU 6 (eval on 7) if the 2-GPU run diverges
 """
 
 from __future__ import annotations
@@ -54,8 +58,14 @@ CRITERIA = {  # best evaluation must satisfy all
     "exp3_full": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
     "exp4": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
     "exp4_resume": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
+    "exp5": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
+    "exp6": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.05), "vel_med_err": ("<=", 0.30), "vel_fall_rate": ("<=", 0.05)},
 }
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
+# exp6 trains to max_iters (no plateau stop) so its GPUs stay occupied; divergence still stops it
+RULES = {"exp6": {**STOP_RULES, "min_iters": STOP_RULES["max_iters"], "max_hours": 40.0}}
+RULES["exp6_1gpu"] = RULES["exp6"]
+CRITERIA["exp5_1gpu"], CRITERIA["exp6_1gpu"] = CRITERIA["exp5"], CRITERIA["exp6"]
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
 TRAIN_ARGS = ["--pi_gn_skip", "5"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01}
@@ -121,7 +131,7 @@ def plateaued(rows: list[dict], patience: int) -> bool:
     return True
 
 
-def stop_reason(tl: list[dict], ev: list[dict], hours: float) -> str | None:
+def stop_reason(tl: list[dict], ev: list[dict], hours: float, rules: dict = STOP_RULES) -> str | None:
     last = ev[-1] if ev else {}
     bad = [r for r in tl[-3:] if any(not math.isfinite(num(r[k])) for k in ("wm_loss", "pi_loss"))]
     sim = [num(r["sim_rew"]) for r in tl if num(r["iteration"]) >= 1000]
@@ -132,11 +142,11 @@ def stop_reason(tl: list[dict], ev: list[dict], hours: float) -> str | None:
         return "diverged (simulator reward collapsed)"
     if len(nr) >= 2 and max(nr) - nr[-1] > 0.3:
         return "diverged (evaluation return collapsed)"
-    if hours > STOP_RULES["max_hours"]:
+    if hours > rules["max_hours"]:
         return "max wall time"
-    if ev and int(num(last["iteration"])) >= STOP_RULES["min_iters"] and plateaued(ev, STOP_RULES["patience"]):
+    if ev and int(num(last["iteration"])) >= rules["min_iters"] and plateaued(ev, rules["patience"]):
         return "converged (no eval improvement)"
-    if ev and int(num(last["iteration"])) >= STOP_RULES["nogo_iters"] and num(last["fail_rate"]) > 0.9 and num(last.get("vel_fall_rate", 1)) > 0.9:
+    if ev and int(num(last["iteration"])) >= rules["nogo_iters"] and num(last["fail_rate"]) > 0.9 and num(last.get("vel_fall_rate", 1)) > 0.9:
         return "no progress"
     return None
 
@@ -145,11 +155,12 @@ class Run:
     """One training process (one or all GPUs) plus its evaluation watcher."""
 
     def __init__(self, name: str, log_dir: str, gpus: list[int], motion_packs: list[str], loco_packs: list[str], seed: int,
-                 extra: list[str] = (), init_ckpt: str | None = None):  # fmt: skip
-        self.name, self.log_dir, self.gpus = name, log_dir, gpus
+                 extra: list[str] = (), init_ckpt: str | None = None, rules: dict = STOP_RULES, eval_gpu: int | None = None):  # fmt: skip
+        self.name, self.log_dir, self.gpus, self.rules = name, log_dir, gpus, rules
+        self.eval_gpu = gpus[-1] if eval_gpu is None else eval_gpu
         os.makedirs(log_dir, exist_ok=True)
         args = ["supermimic/train.py", "--log_dir", log_dir, "--motion_packs", *motion_packs, "--loco_packs", *loco_packs,
-                "--iterations", str(STOP_RULES["max_iters"]), "--seed", str(seed), *TRAIN_ARGS, *extra]  # fmt: skip
+                "--iterations", str(rules["max_iters"]), "--seed", str(seed), *TRAIN_ARGS, *extra]  # fmt: skip
         if os.path.exists(os.path.join(log_dir, "last.pt")):
             args += ["--resume", os.path.join(log_dir, "last.pt")]
         elif init_ckpt:  # continue another experiment's run (weights, optimizers, normalizers, iteration)
@@ -165,7 +176,7 @@ class Run:
         log(f"{name}: started train pid {self.train.pid} on GPUs {gpus}: {' '.join(cmd)}")
 
     def start_eval(self):
-        env = {**self.env, "CUDA_VISIBLE_DEVICES": str(self.gpus[-1])}
+        env = {**self.env, "CUDA_VISIBLE_DEVICES": str(self.eval_gpu)}
         self.evaler = subprocess.Popen([PY, "supermimic/evaluate.py", "--run_dir", self.log_dir, "--watch"], cwd=REPO, env=env,
                                        stdout=open(os.path.join(self.log_dir, "eval_stdout.log"), "a"), stderr=subprocess.STDOUT,
                                        start_new_session=True)  # fmt: skip
@@ -179,7 +190,7 @@ class Run:
             log(f"{self.name}: eval watcher exited ({self.evaler.returncode}); restarting it")
             self.start_eval()
         if rc is None and self.reason is None:
-            self.reason = stop_reason(tl, ev, (time.time() - self.t0) / 3600)
+            self.reason = stop_reason(tl, ev, (time.time() - self.t0) / 3600, self.rules)
             if self.reason:
                 log(f"{self.name}: stopping at it {tl[-1]['iteration'] if tl else 0}: {self.reason}")
                 open(os.path.join(self.log_dir, "STOP"), "w").write(self.reason + "\n")
@@ -211,18 +222,19 @@ class Run:
 
 
 def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], per_gpu: bool = True, extra: list[str] = (),
-                   init_from: str | None = None) -> dict:  # fmt: skip
-    """per_gpu: one single-GPU run per GPU (seed = GPU index); else one run on all GPUs.
+                   init_from: str | None = None, gpus: list[int] | None = None, eval_gpu: int | None = None) -> dict:  # fmt: skip
+    """per_gpu: one single-GPU run per GPU (seed = GPU index); else one run (seed 0) on all GPUs, or on `gpus`.
     init_from: experiment whose run with the same seed initializes each run (from its last.pt)."""
     st = status.setdefault(name, {})
     if st.get("state") in ("success", "failed"):
         log(f"{name}: already {st['state']}, skipping")
         return st
     crit = CRITERIA[name]
-    specs = [(f"{name}/s{g}", [g], g) for g in range(NGPU)] if per_gpu else [(name, list(range(NGPU)), 0)]
+    rules = RULES.get(name, STOP_RULES)
+    specs = [(f"{name}/s{g}", [g], g) for g in range(NGPU)] if per_gpu else [(name, gpus or list(range(NGPU)), 0)]
     runs_st = st.setdefault("runs", {})
     init = lambda seed: os.path.join(REPO, "logs", init_from, f"s{seed}", "last.pt") if init_from else None  # noqa: E731
-    runs = [Run(n, os.path.join(REPO, "logs", n), gpus, motion_packs, loco_packs, seed, extra, init(seed)) for n, gpus, seed in specs
+    runs = [Run(n, os.path.join(REPO, "logs", n), g, motion_packs, loco_packs, seed, extra, init(seed), rules, eval_gpu) for n, g, seed in specs
             if runs_st.get(n, {}).get("state") not in ("success", "failed", "diverged")]  # fmt: skip
     st.update(state="running", started=st.get("started", time.strftime("%Y-%m-%d %H:%M:%S")), motion_packs=motion_packs,
               loco_packs=loco_packs, criteria=crit)  # fmt: skip
@@ -240,10 +252,10 @@ def run_experiment(name: str, motion_packs: list[str], loco_packs: list[str], pe
                 active.remove(r)
                 # keep the GPU busy: a run that ended before min_iters gets one replacement seed while others still train
                 g = r.gpus[0]
-                if per_gpu and active and g not in replaced and info["iteration"] < STOP_RULES["min_iters"]:
+                if per_gpu and active and g not in replaced and info["iteration"] < rules["min_iters"]:
                     replaced.add(g)
                     n = f"{name}/s{g + NGPU}"
-                    active.append(Run(n, os.path.join(REPO, "logs", n), [g], motion_packs, loco_packs, g + NGPU, extra, init(g)))
+                    active.append(Run(n, os.path.join(REPO, "logs", n), [g], motion_packs, loco_packs, g + NGPU, extra, init(g), rules))
         save_status()
         log(f"{name}: " + " | ".join(f"{n.split('/')[-1]} it {s.get('iteration')} rb {s.get('rollbacks')} "
                                      f"eval {s.get('last_eval', {}).get('norm_return')}/{s.get('last_eval', {}).get('vel_med_err')} {s.get('state')}"
@@ -290,6 +302,21 @@ if __name__ == "__main__":
         run_experiment("exp4", [ALL], loco, extra=["--ref_cmd_prob", "0"])
         run_experiment("exp4_resume", [ALL], loco, extra=["--ref_cmd_prob", "0"], init_from="exp3")
         log("exp4 done")
+    elif sys.argv[1:] == ["selfcol"]:  # self-collisions (train.py default since 1830e2c), one seed data parallel on GPUs 6+7
+        loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
+
+        def two_gpu_then_one(name: str, extra: list[str]) -> dict:
+            """Data parallel on GPUs 6+7; if that run diverges or crashes, redo it from scratch on GPU 6 (the
+            paper's single-GPU setting, as exp2/exp3) with its evaluation watcher on GPU 7."""
+            st = run_experiment(name, [ALL], loco, per_gpu=False, gpus=[6, 7], extra=extra)
+            if st.get("runs", {}).get(name, {}).get("state") in ("diverged", "crashed"):
+                log(f"{name}: 2-GPU run {st['runs'][name]['state']}; retrying single-GPU as {name}_1gpu")
+                st = run_experiment(f"{name}_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
+            return st
+
+        two_gpu_then_one("exp5", ["--self_collision"])  # exp3 setup
+        two_gpu_then_one("exp6", ["--self_collision", "--ref_cmd_prob", "0"])  # exp4 setup, trained to max_iters
+        log("selfcol done")
     elif sys.argv[1:] == ["exp3_full"]:  # exp3 with the unfiltered motion library, velocity library as chosen for exp3
         loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
         run_experiment("exp3_full", [ALL_RAW], loco)
