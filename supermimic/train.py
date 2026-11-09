@@ -58,6 +58,11 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--self_collision", action=argparse.BooleanOptionalAction, default=True,
                     help="collisions between non-adjacent robot links (exp1-exp4 ran without: --no-self_collision)")
+parser.add_argument("--upper_cmd", action="store_true",
+                    help="velocity interface also takes waist/arm target positions (+ per-group tracking flags) and tracks them")
+parser.add_argument("--init_from", type=str, default=None,
+                    help="start from this checkpoint's world model, motion encoder, decoder and motion critic; modules whose "
+                         "shapes changed (velocity encoder/critic under --upper_cmd) and the policy optimizer start fresh")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
 
@@ -68,7 +73,7 @@ import torch.nn as nn
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, use_warp_stream
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MAX_STEP_REWARD_VEL, MDP, OBS_DIM, REL_DIM, VEL_CRITIC_DIM
+from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, OBS_DIM, REL_DIM, vel_critic_dim
 from supermimic.mdp import normalize_xi, unflatten_state
 from supermimic.motion import MotionLib
 import supermimic.networks as networks
@@ -94,7 +99,8 @@ if MAIN:
 
 kin = G1Kinematics(dev)
 motion = MotionLib.from_packs(args.motion_packs, args.loco_packs, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev), upper_cmd=args.upper_cmd)
+MAX_STEP_REWARD_VEL = mdp.max_step_reward_vel
 VEL = len(args.loco_packs) > 0
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K + REL_DIM
@@ -108,9 +114,9 @@ if MAIN:
           f"loco clips {int(motion.in_loco.sum())}; body cache {motion.cached_bodies}; world {WORLD}, lr {LR:.2e}", flush=True)  # fmt: skip
 
 wm = WorldModel().to(dev)
-pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
+pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
-critic_v = Critic(VEL_CRITIC_DIM).to(dev)
+critic_v = Critic(vel_critic_dim(args.upper_cmd)).to(dev)
 opt_wm = torch.optim.Adam(wm.parameters(), lr=LR)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=LR, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=LR)
@@ -123,6 +129,19 @@ if args.resume:
     for k, m in {**MODELS, **OPTS}.items():
         m.load_state_dict(ck[k])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+elif args.init_from:  # weights (with their normalizers) only; optimizers, iteration and rollback state start anew
+    ck0 = torch.load(args.init_from, map_location=dev)
+    loaded = []
+    for k, m in MODELS.items():
+        if k not in ck0:  # ckpt_*.pt files hold pi and wm only; last.pt has the critics too
+            continue
+        own = m.state_dict()
+        keep = {n: t for n, t in ck0[k].items() if n in own and own[n].shape == t.shape}
+        m.load_state_dict(keep, strict=False)
+        loaded.append(f"{k} {len(keep)}/{len(own)}")
+    if MAIN:
+        print(f"[init] from {args.init_from} (it {ck0['iteration']}), tensors loaded: " + ", ".join(loaded), flush=True)
+    del ck0
 if WORLD > 1:
     for m in MODELS.values():
         for t in list(m.parameters()) + list(m.buffers()):
@@ -194,7 +213,7 @@ def _imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref):
     f1 = torch.minimum(f + 1, motion.clip_end[motion.clip_id[f]])
     o1 = mdp.add_noise(mdp.obs(S1, a, xi))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
-    cmd1 = torch.where(cmd_ref.unsqueeze(-1), motion.ref_cmd[f1], cmd)
+    cmd1 = torch.where(cmd_ref.unsqueeze(-1), mdp.ref_full_cmd(f1), cmd)
     return S1, a, o_hist, f1, cmd1, align
 
 
@@ -381,7 +400,7 @@ def policy_update():
 # ------------------------------------------------------------------------------------------------
 env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp, ref_cmd_prob=args.ref_cmd_prob,
                   self_collision=args.self_collision)
-buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
+buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, cmd_dim=mdp.cmd_dim)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 is_vel = env.is_vel
 
@@ -412,7 +431,12 @@ def collect(n_steps: int, stats: dict):
         stats["r"].append(out["r"][:N_MO].mean() / MAX_STEP_REWARD)
         if VEL:
             stats["r_v"].append(out["r"][N_MO:].mean() / MAX_STEP_REWARD_VEL)
-            stats["cmd_err"].append((mdp.heading_vel(unflatten_state(out["s1"]))[N_MO:] - out["cmd"][N_MO:]).norm(dim=-1).mean())
+            S1v = unflatten_state(out["s1"][N_MO:])
+            stats["cmd_err"].append((mdp.heading_vel(S1v) - out["cmd"][N_MO:, :3]).norm(dim=-1).mean())
+            if args.upper_cmd:  # mean |error| (rad) over the tracked joints of envs that track any group
+                tracked = out["cmd"][N_MO:, -3:].sum(-1) > 0
+                e = mdp.upper_err(S1v[4], out["cmd"][N_MO:])[1]
+                stats["upper_err"].append((e * tracked).sum() / tracked.sum().clamp(min=1))
         if "ep_len" in out:
             for key, sel in (("", ~out["done_vel"]), ("_v", out["done_vel"])):
                 ids = out["done_ids"][sel]
@@ -420,13 +444,13 @@ def collect(n_steps: int, stats: dict):
                 stats["term" + key].append(out["term"][ids].float().sum()), stats["done" + key].append(sel.float().sum())
 
 
-STAT_KEYS = ["blown", "r", "r_v", "cmd_err", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
+STAT_KEYS = ["blown", "r", "r_v", "cmd_err", "upper_err", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
 stats = {k: [] for k in STAT_KEYS}
 collect(args.warmup_steps, stats)  # the replay buffer is not checkpointed: refill it on resume too
 COLS = ["iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm", "imag_survival",
         "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "v_loss_v", "imag_rew_v", "imag_survival_v", "align",
         "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups", "gn_enc",
-        "gn_enc_vel", "gn_dec", "pi_skip_frac", "rollbacks", "pi_lr_mult"]  # fmt: skip
+        "gn_enc_vel", "gn_dec", "pi_skip_frac", "rollbacks", "pi_lr_mult", "upper_err"]  # fmt: skip
 if MAIN:
     new_log = not os.path.exists(os.path.join(args.log_dir, "train_log.csv"))
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
@@ -529,14 +553,14 @@ for it in range(start_it, args.iterations):
                    mean("surv"), smean("r"), ssum("ep_len") / dn, ssum("ep_ret") / dn, ssum("term") / dn, mean("v_loss_v"),
                    mean("imag_rew_v"), mean("surv_v"), mean("align"), smean("r_v"), smean("cmd_err"), ssum("ep_len_v") / dv,
                    ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr, ssum("blown"), mean("gn_enc"), mean("gn_enc_vel"),
-                   mean("gn_dec"), mean("pi_skip"), rb["count"], rb["lr_mult"]]  # fmt: skip
+                   mean("gn_dec"), mean("pi_skip"), rb["count"], rb["lr_mult"], smean("upper_err")]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
             r = dict(zip(COLS, row))
             print(f"it {it + 1} | {wall_h:.3f} h | wm {r['wm_loss']:.4f} e8 {r['wm_err8']:.4f} | pi {r['pi_loss']:.3f} imag_r {r['imag_rew']:.3f} "
                   f"surv {r['imag_survival']:.3f} | sim_r {r['sim_rew']:.3f} ep_ret {r['ep_ret_norm']:.3f} term {r['term_frac']:.2f} | "
                   f"vel: imag_r {r['imag_rew_v']:.3f} sim_r {r['sim_rew_v']:.3f} cmd_err {r['cmd_err']:.3f} fall {r['fall_frac_v']:.2f} "
-                  f"align {r['align']:.4f} | blowups {int(r['sim_blowups'])} | {ips:.2f} it/s", flush=True)  # fmt: skip
+                  f"align {r['align']:.4f}" + (f" upper_err {r['upper_err']:.3f}" if args.upper_cmd else "") + f" | blowups {int(r['sim_blowups'])} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in STAT_KEYS}
         agg = {}
         if bool(stop):

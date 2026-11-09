@@ -44,6 +44,22 @@ MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
 MAX_STEP_REWARD_VEL = (2.0 + 2.0) * CONTROL_DT
 CMD_SCALE = (1.5, 1.0, 2.0)  # command normalization for the velocity encoder and critic
 
+# Optional upper-body command of the velocity interface (``upper_cmd``): target positions of the waist and
+# arm joints (G1_JOINT_NAMES[12:29]) and one tracking flag per group (waist, left arm, right arm). The full
+# command is [vx, vy, yaw rate, 17 targets, 3 flags]; an untracked group's target is ignored.
+UPPER = slice(12, 29)
+UPPER_GROUPS = (3, 7, 7)
+N_UPPER = sum(UPPER_GROUPS)
+UPPER_CMD_DIM = N_UPPER + len(UPPER_GROUPS)
+
+
+def cmd_dim(upper_cmd: bool) -> int:
+    return 3 + (UPPER_CMD_DIM if upper_cmd else 0)
+
+
+def vel_critic_dim(upper_cmd: bool) -> int:
+    return INV_DIM + 3 + 3 + XI_DIM + ((UPPER_CMD_DIM + N_UPPER) if upper_cmd else 0)
+
 
 @dataclass
 class RewardCfg:
@@ -68,6 +84,8 @@ class VelRewardCfg:
     w_joint_limit: float = -2.0
     w_lean: float = -4.0
     w_rp_rate: float = -0.05
+    w_upper: float = 1.5  # upper-body command tracking (upper_cmd only)
+    upper_std: float = 0.3  # rad, on the mean squared error over the tracked joints
     fall_height: float = 0.35
     fall_tilt: float = 0.7
 
@@ -104,8 +122,11 @@ INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
 
 class MDP:
     def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg(),
-                 vcfg: VelRewardCfg = VelRewardCfg()):  # fmt: skip
+                 vcfg: VelRewardCfg = VelRewardCfg(), upper_cmd: bool = False):  # fmt: skip
         self.kin, self.motion, self.cfg, self.vcfg = kin, motion, cfg, vcfg
+        self.upper_cmd = upper_cmd
+        self.cmd_dim = cmd_dim(upper_cmd)
+        self.max_step_reward_vel = MAX_STEP_REWARD_VEL + (vcfg.w_upper * CONTROL_DT if upper_cmd else 0.0)
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
@@ -113,6 +134,7 @@ class MDP:
         self.obs_noise = OBS_NOISE.to(dev)
         self.obs_scale = OBS_SCALE.to(dev)
         self.cmd_scale = torch.tensor(CMD_SCALE, device=dev)
+        self.group_of_joint = torch.repeat_interleave(torch.arange(len(UPPER_GROUPS), device=dev), torch.tensor(UPPER_GROUPS, device=dev))
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi) -> torch.Tensor:
@@ -217,19 +239,52 @@ class MDP:
         vh = (yaw_mat(R).transpose(-1, -2) @ v.unsqueeze(-1)).squeeze(-1)
         return torch.cat((vh[..., :2], w[..., 2:3]), -1)
 
+    # ---------------- upper-body command (upper_cmd) ----------------
+    def full_cmd(self, vel: torch.Tensor, target: torch.Tensor | None = None, track: torch.Tensor | None = None) -> torch.Tensor:
+        """Pad a (..., 3) velocity command to the interface's command; by default no upper-body group is tracked."""
+        if not self.upper_cmd:
+            return vel
+        lead = vel.shape[:-1]
+        target = self.default_q[UPPER].expand(*lead, N_UPPER) if target is None else target
+        track = torch.zeros(*lead, len(UPPER_GROUPS), device=vel.device) if track is None else track.float()
+        return torch.cat((vel, target, track), -1)
+
+    def ref_full_cmd(self, f: torch.Tensor) -> torch.Tensor:
+        """Command read from the reference: its velocity and, with upper_cmd, its waist/arm pose (all groups tracked)."""
+        vel = self.motion.ref_cmd[f]
+        if not self.upper_cmd:
+            return vel
+        return self.full_cmd(vel, self.motion.q[f][..., UPPER], torch.ones(*f.shape, len(UPPER_GROUPS), device=f.device))
+
+    def upper_mask(self, cmd: torch.Tensor) -> torch.Tensor:
+        """Per-joint tracking weight (..., 17) of a full command."""
+        return cmd[..., 3 + N_UPPER :][..., self.group_of_joint]
+
+    def upper_err(self, q: torch.Tensor, cmd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mean squared and mean absolute error over the tracked upper-body joints (0 if none is tracked)."""
+        m = self.upper_mask(cmd)
+        d = q[..., UPPER] - cmd[..., 3 : 3 + N_UPPER]
+        n = m.sum(-1).clamp(min=1)
+        return (m * d**2).sum(-1) / n, (m * d.abs()).sum(-1) / n
+
+    # ---------------- velocity interface (Table A.6) ----------------
     def vel_reward(self, S, cmd, a, a_prev, terms: bool = False):
         c = self.vcfg
         p, R, v, w, q, qd = S
         H = yaw_mat(R)
         Ht = H.transpose(-1, -2)
-        _, bR, _, bw = self.kin.forward(p, R, v, w, q, qd)
         vel = self.heading_vel(S)
         e_lin = ((vel[..., :2] - cmd[..., :2]) ** 2).sum(-1)
         e_yaw = (vel[..., 2] - cmd[..., 2]) ** 2
-        z_torso = (Ht @ bR[..., TORSO, :, 2:3]).squeeze(-1)  # torso z-axis in the heading frame
-        w_torso = (Ht @ bw[..., TORSO, :].unsqueeze(-1)).squeeze(-1)
-        lean = z_torso[..., 1] ** 2  # sideways lean sin^2(phi); forward lean is not penalized
-        rp_rate = w_torso[..., 0] ** 2 + w_torso[..., 1] ** 2
+        if self.upper_cmd:
+            # a commanded waist pose tilts the torso on purpose: lean and roll/pitch rate are taken at the pelvis
+            z_up, w_up = (Ht @ R[..., :, 2:3]).squeeze(-1), (Ht @ w.unsqueeze(-1)).squeeze(-1)
+        else:
+            _, bR, _, bw = self.kin.forward(p, R, v, w, q, qd)
+            z_up = (Ht @ bR[..., TORSO, :, 2:3]).squeeze(-1)  # torso z-axis in the heading frame
+            w_up = (Ht @ bw[..., TORSO, :].unsqueeze(-1)).squeeze(-1)
+        lean = z_up[..., 1] ** 2  # sideways lean sin^2(phi); forward lean is not penalized
+        rp_rate = w_up[..., 0] ** 2 + w_up[..., 1] ** 2
         r = (
             c.w_lin * torch.exp(-e_lin / 0.5**2)
             + c.w_yaw * torch.exp(-e_yaw / 0.5)
@@ -237,9 +292,14 @@ class MDP:
             + c.w_joint_limit * self.joint_limit(q)
             + c.w_lean * lean
             + c.w_rp_rate * rp_rate
-        ) * CONTROL_DT
+        )
+        e_up = None
+        if self.upper_cmd:
+            e_up = self.upper_err(q, cmd)[0]  # untracked joints: error 0, full reward
+            r = r + c.w_upper * torch.exp(-e_up / c.upper_std**2)
+        r = r * CONTROL_DT
         if terms:
-            return r, {"e_lin": e_lin, "e_yaw": e_yaw, "lean": lean}
+            return r, {"e_lin": e_lin, "e_yaw": e_yaw, "lean": lean, "e_upper": e_up}
         return r
 
     def fall(self, S) -> torch.Tensor:
@@ -252,14 +312,24 @@ class MDP:
         return 1 - alive
 
     def norm_cmd(self, cmd: torch.Tensor) -> torch.Tensor:
-        return cmd / self.cmd_scale
+        """Encoder/critic command input: scaled velocity; with upper_cmd, targets relative to the default pose
+        (zeroed for untracked groups) and the tracking flags."""
+        if not self.upper_cmd:
+            return cmd / self.cmd_scale
+        m = self.upper_mask(cmd)
+        t = (cmd[..., 3 : 3 + N_UPPER] - self.default_q[UPPER]) * m
+        return torch.cat((cmd[..., :3] / self.cmd_scale, t, cmd[..., 3 + N_UPPER :]), -1)
 
     def vel_critic_features(self, S, cmd, xi) -> torch.Tensor:
-        return torch.cat((invariant_features(S), self.norm_cmd(cmd), self.norm_cmd(self.heading_vel(S) - cmd), xi), -1)
+        e_vel = (self.heading_vel(S) - cmd[..., :3]) / self.cmd_scale
+        if not self.upper_cmd:
+            return torch.cat((invariant_features(S), self.norm_cmd(cmd), e_vel, xi), -1)
+        e_up = (S[4][..., UPPER] - cmd[..., 3 : 3 + N_UPPER]) * self.upper_mask(cmd)
+        return torch.cat((invariant_features(S), self.norm_cmd(cmd), e_vel, e_up, xi), -1)
 
 
 CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
-VEL_CRITIC_DIM = INV_DIM + 3 + 3 + XI_DIM
+VEL_CRITIC_DIM = vel_critic_dim(False)
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:

@@ -9,7 +9,10 @@ are evaluated.
 Velocity commands (App. G.2): from standing, the policy receives a fixed command for 5 s; the relative
 steady-state error is the norm of the mean (vx, vy, yaw rate) error over the last 2 s over the command
 norm. 672 commands (15 x 15 grids on the three planes of the command space, standing left out), 4
-trials each; the per-command value is the median over the trials that did not fall (0.9 if all fell).
+trials each; the per-command value is the median over the trials that did not fall (0.9 if all fell). Runs with ``upper_cmd``: the first half of the trials leave the
+waist and arms untracked (comparable to runs without it), the second half track the waist/arm pose of a
+fixed random motion-library frame per command; ``upper_med_err`` is the median over those non-falling
+trials of the mean |joint error| (rad) over the last 2 s, and the velocity error is also reported per half.
 
 Run as a watcher: ``python supermimic/evaluate.py --run_dir logs/<run> --watch``.
 """
@@ -43,7 +46,7 @@ import supermimic.networks as networks
 from supermimic.env import TrackingSim, use_warp_stream
 from supermimic.env import CMD_HI, CMD_LO
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MAX_STEP_REWARD, MDP, OBS_DIM, REL_DIM
+from supermimic.mdp import MAX_STEP_REWARD, MDP, OBS_DIM, REL_DIM, UPPER, UPPER_GROUPS
 from supermimic.motion import MotionLib
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
@@ -56,7 +59,8 @@ while not os.path.exists(os.path.join(args.run_dir, "args.json")):  # the traine
 run_args = json.load(open(os.path.join(args.run_dir, "args.json")))
 kin = G1Kinematics(dev)
 motion = MotionLib.from_packs(run_args["motion_packs"], run_args["loco_packs"], kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+UPPER_CMD = run_args.get("upper_cmd", False)
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev), upper_cmd=UPPER_CMD)
 VEL = len(run_args["loco_packs"]) > 0
 K, Hh = run_args["goal_frames"], run_args["hist"]
 SELF_COL = run_args.get("self_collision", False)  # runs before the flag existed had none
@@ -93,11 +97,20 @@ if VEL:
     env_v = TrackingSim(len(CMDS) * args.trials, motion, mdp, dev, eval_mode=True, n_vel=len(CMDS) * args.trials,
                         self_collision=SELF_COL)
     longest = motion.clip_start[torch.argmax(torch.where(motion.in_loco, motion.clip_len, 0))]
+    n_tr = len(CMDS) * args.trials
+    CMDS_FULL = mdp.full_cmd(CMDS.repeat(args.trials, 1))  # (trials * commands, cmd_dim), trial-major
+    UP_TRIAL = torch.zeros(n_tr, dtype=torch.bool, device=dev)
+    if UPPER_CMD:
+        UP_TRIAL = (torch.arange(n_tr, device=dev) // len(CMDS)) >= args.trials // 2
+        mo_frames = torch.cat([torch.arange(int(motion.clip_start[c]), int(motion.clip_end[c]) + 1, 25) for c in mo_ids.tolist()])
+        pick = mo_frames[torch.randint(len(mo_frames), (n_tr,), generator=gen)].to(dev)
+        track = UP_TRIAL.float().unsqueeze(-1).expand(n_tr, len(UPPER_GROUPS))
+        CMDS_FULL = mdp.full_cmd(CMDS.repeat(args.trials, 1), motion.q[pick][:, UPPER], track)
 
 
 def load_policy(ck: dict) -> Policy:
     networks.AMP_DTYPE = torch.bfloat16 if ck["args"].get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K + REL_DIM, hist=Hh).to(dev)
+    pi = Policy(OBS_DIM, 73 * K + REL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim).to(dev)
     pi.load_state_dict(ck["pi"])
     return pi.eval()
 
@@ -137,10 +150,11 @@ def eval_velocity(pi: Policy) -> dict:
     env.done_eval[:] = False
     env.failed_eval[:] = False
     env.reset_standing(ids, longest.expand(n).clone())
-    env.cmd[:] = CMDS.repeat(args.trials, 1)
+    env.cmd[:] = CMDS_FULL
     env.cmd_ref[:] = False
     fell = torch.zeros(n, dtype=torch.bool, device=dev)
     err_sum = torch.zeros(n, 3, device=dev)
+    up_sum = torch.zeros(n, device=dev)
     hist = None
     for t in range(250):
         S = env.state()
@@ -150,14 +164,28 @@ def eval_velocity(pi: Policy) -> dict:
         S1 = env.state()
         fell |= mdp.fall(S1)
         if t >= 150:
-            err_sum += mdp.heading_vel(S1) - env.cmd
-    rel = ((err_sum / 100).norm(dim=-1) / env.cmd.norm(dim=-1)).view(args.trials, T)
+            err_sum += mdp.heading_vel(S1) - env.cmd[:, :3]
+            if UPPER_CMD:
+                up_sum += mdp.upper_err(S1[4], env.cmd)[1]
+    rel = ((err_sum / 100).norm(dim=-1) / env.cmd[:, :3].norm(dim=-1)).view(args.trials, T)
     fell = fell.view(args.trials, T)
-    per_cmd = torch.where(fell, torch.nan, rel).nanmedian(0).values
-    all_fell = fell.all(0)
-    per_cmd = torch.where(all_fell, 0.9, per_cmd.clamp(max=0.9))
-    return {"vel_med_err": per_cmd.median().item(), "vel_mean_err": per_cmd.mean().item(), "vel_fall_rate": fell.float().mean().item(),
-            "vel_cmds_all_fell": int(all_fell.sum()), "vel_per_cmd": [round(x, 4) for x in per_cmd.tolist()]}  # fmt: skip
+
+    def per_command(rows: slice):
+        per = torch.where(fell[rows], torch.nan, rel[rows]).nanmedian(0).values
+        all_fell = fell[rows].all(0)
+        return torch.where(all_fell, 0.9, per.clamp(max=0.9)), all_fell
+
+    per_cmd, all_fell = per_command(slice(None))
+    res = {"vel_med_err": per_cmd.median().item(), "vel_mean_err": per_cmd.mean().item(), "vel_fall_rate": fell.float().mean().item(),
+           "vel_cmds_all_fell": int(all_fell.sum()), "vel_per_cmd": [round(x, 4) for x in per_cmd.tolist()]}  # fmt: skip
+    if UPPER_CMD:
+        h = args.trials // 2
+        up = (up_sum / 100).view(args.trials, T)[h:]
+        res.update(upper_med_err=up[~fell[h:]].median().item() if bool((~fell[h:]).any()) else float("nan"),
+                   vel_med_err_free=per_command(slice(0, h))[0].median().item(),
+                   vel_med_err_up=per_command(slice(h, None))[0].median().item(),
+                   vel_fall_rate_up=fell[h:].float().mean().item())  # fmt: skip
+    return res
 
 
 def evaluate(ck: dict) -> dict:
@@ -170,6 +198,8 @@ def evaluate(ck: dict) -> dict:
 
 COLS = ["iteration", "train_wall_h", "saved_at", "eval_at", "norm_return", "fail_rate", "n_failed", "n_clips", "loco_norm_return",
         "loco_fail_rate", "vel_med_err", "vel_mean_err", "vel_fall_rate", "vel_cmds_all_fell"]  # fmt: skip
+if UPPER_CMD:
+    COLS += ["upper_med_err", "vel_med_err_free", "vel_med_err_up", "vel_fall_rate_up"]
 
 if args.ckpt:
     res = evaluate(torch.load(args.ckpt, map_location=dev))
@@ -196,6 +226,8 @@ while True:
         json.dump(res, open(c.replace(".pt", "_eval.json"), "w"), indent=1)
         print(f"[eval] it {it} ({ck['wall_time'] / 3600:.2f} h): motion return {res['norm_return']:.4f}, failed {res['n_failed']}/{res['n_clips']}"
               + (f" | vel med err {res['vel_med_err']:.3f}, fall {res['vel_fall_rate']:.3f}" if VEL else "")
+              + (f" | upper err {res['upper_med_err']:.3f} rad, vel err free/upper {res['vel_med_err_free']:.3f}/{res['vel_med_err_up']:.3f}"
+                 if VEL and UPPER_CMD else "")
               + f" ({time.time() - t0:.0f}s)", flush=True)  # fmt: skip
         done.add(it)
     if not args.watch:

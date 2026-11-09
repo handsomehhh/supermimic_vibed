@@ -52,9 +52,9 @@ ra = ck["args"]
 K, Hh = ra["goal_frames"], ra["hist"]
 kin = G1Kinematics(dev)
 motion = MotionLib.from_packs(ra["motion_packs"], ra.get("loco_packs", []), kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev), upper_cmd=ra.get("upper_cmd", False))
 networks.AMP_DTYPE = torch.bfloat16 if ra.get("amp", "none") == "bf16" else None
-pi = Policy(OBS_DIM, 73 * K + REL_DIM, hist=Hh).to(dev)
+pi = Policy(OBS_DIM, 73 * K + REL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim).to(dev)
 pi.load_state_dict(ck["pi"])
 pi.eval()
 VEL = len(ra.get("loco_packs", [])) > 0
@@ -162,7 +162,7 @@ def record_velocity():
     fell = torch.zeros(E, dtype=torch.bool, device=dev)
     hist = None
     for t in range(T):
-        env.cmd[:] = cmds[t]
+        env.cmd[:] = mdp.full_cmd(cmds[t])  # with upper_cmd: waist and arms untracked
         S = env.state()
         rec["root_p"].append(S[0]), rec["root_quat"].append(mat_to_quat(S[1])), rec["q"].append(S[4])
         rec["cmd"].append(cmds[t]), rec["meas"].append(mdp.heading_vel(S)), rec["alive"].append(~fell)

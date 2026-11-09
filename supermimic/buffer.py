@@ -23,10 +23,10 @@ FIELDS = {
 
 
 class ReplayBuffer:
-    def __init__(self, T: int, N: int, device: str):
+    def __init__(self, T: int, N: int, device: str, cmd_dim: int = 3):
         self.T, self.N, self.device = T, N, device
         self.data = {}
-        for k, (shape, dt) in FIELDS.items():
+        for k, (shape, dt) in {**FIELDS, "cmd": (cmd_dim, torch.float32)}.items():
             shp = (T, N) + ((shape,) if isinstance(shape, int) else shape)
             self.data[k] = torch.zeros(shp, dtype=dt, device=device)
         self.ptr, self.size = 0, 0

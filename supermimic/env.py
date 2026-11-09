@@ -14,8 +14,8 @@ import mujoco_warp as mjw
 import torch
 import warp as wp
 
-from .mdp import MAX_STEP_REWARD, MAX_STEP_REWARD_VEL, MDP, flatten_state
-from .motion import CONTROL_DT, MotionLib
+from .mdp import MAX_STEP_REWARD, MDP, UPPER, UPPER_GROUPS, flatten_state
+from .motion import BIN_FRAMES, CONTROL_DT, MotionLib
 from .robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list, sim_model
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 
@@ -25,6 +25,7 @@ CMD_HI = (2.0, 1.32, 3.35)
 CMD_RESAMPLE_STEPS = 250
 # a world whose velocities exceed these bounds (or turn non-finite) has blown up numerically
 MAX_ROOT_VEL, MAX_JOINT_VEL = 50.0, 100.0
+UPPER_TRACK_PROB = 0.75  # uniform commands with upper_cmd: probability that a waist/arm group is tracked
 
 
 def use_warp_stream(device: str):
@@ -108,7 +109,7 @@ class TrackingSim:
         self.G_max = MAX_STEP_REWARD / (1 - gamma)
         self.bin_G = torch.zeros(motion.num_bins, device=dev)
         self.bin_w_avg = torch.where(motion.bin_motion, 1.0, 0.0) / motion.bin_motion.sum().clamp(min=1)
-        self.cmd = torch.zeros(self.N, 3, device=dev)
+        self.cmd = mdp.full_cmd(torch.zeros(self.N, 3, device=dev))
         self.cmd_ref = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.cmd_lo, self.cmd_hi = torch.tensor(CMD_LO, device=dev), torch.tensor(CMD_HI, device=dev)
         self.resample_cmd_enabled = not eval_mode
@@ -162,7 +163,15 @@ class TrackingSim:
         self.cmd_ref[env_ids] = torch.rand(n, device=dev) < self.ref_cmd_prob
         u = self.cmd_lo + (self.cmd_hi - self.cmd_lo) * torch.rand(n, 3, device=dev)
         u = torch.where((torch.rand(n, 1, device=dev) < 0.1), 0.0, u)
-        self.cmd[env_ids] = torch.where(self.cmd_ref[env_ids, None], self.motion.ref_cmd[self.f[env_ids]], u)
+        if self.mdp.upper_cmd:
+            # waist/arm pose of a random motion-library frame; each group tracked with probability UPPER_TRACK_PROB
+            m = self.motion
+            bins = torch.multinomial(m.bin_motion.float(), n, replacement=True)
+            span = (m.clip_end[m.bin_clip[bins]] - m.bin_start[bins] + 1).clamp(max=BIN_FRAMES)
+            f = m.bin_start[bins] + (torch.rand(n, device=dev) * span.float()).long()
+            track = torch.rand(n, len(UPPER_GROUPS), device=dev) < UPPER_TRACK_PROB
+            u = self.mdp.full_cmd(u, m.q[f][:, UPPER], track)
+        self.cmd[env_ids] = torch.where(self.cmd_ref[env_ids, None], self.mdp.ref_full_cmd(self.f[env_ids]), u)
 
     def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
         if len(env_ids) == 0:
@@ -262,7 +271,7 @@ class TrackingSim:
         self.ep_step = ep_step + 1
         self.a_prev = a.clone()
         if self.resample_cmd_enabled:
-            self.cmd[cmd_ref] = self.motion.ref_cmd[f1[cmd_ref]]
+            self.cmd[cmd_ref] = self.mdp.ref_full_cmd(f1[cmd_ref])
             due = (vel & (self.ep_step % CMD_RESAMPLE_STEPS == 0)).nonzero(as_tuple=False).squeeze(-1)
             self.resample_cmd(due)
         if self.eval_mode:
@@ -282,7 +291,7 @@ class TrackingSim:
             out["done_ids"] = ids
             out["done_vel"] = vel[ids]
             out["ep_len"] = T
-            out["ep_ret_norm"] = self.ep_ret[ids] / (T * torch.where(vel[ids], MAX_STEP_REWARD_VEL, MAX_STEP_REWARD))
+            out["ep_ret_norm"] = self.ep_ret[ids] / (T * torch.where(vel[ids], self.mdp.max_step_reward_vel, MAX_STEP_REWARD))
             if bool(bad.any()):  # clear the solver state (warm start, contacts) of blown-up worlds
                 self.blown.copy_(bad)
                 with wp.ScopedDevice(self.wp_device):

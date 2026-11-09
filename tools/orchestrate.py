@@ -27,6 +27,8 @@ resumes unfinished runs from their last.pt. Status: logs/orchestrator.json.
   python tools/orchestrate.py selfcol   exp5 (exp3 + self-collisions), then exp6 (exp4 + self-collisions,
                                         trained to max_iters); one seed, data parallel on GPUs 6+7,
                                         redone on GPU 6 (eval on 7) if the 2-GPU run diverges
+  python tools/orchestrate.py upper     exp7: exp5 + waist/arm target command (--upper_cmd), warm-started
+                                        from exp5's last.pt; GPUs 6+7, same single-GPU fallback
 """
 
 from __future__ import annotations
@@ -66,9 +68,10 @@ STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hou
 RULES = {"exp6": {**STOP_RULES, "min_iters": STOP_RULES["max_iters"], "max_hours": 40.0}}
 RULES["exp6_1gpu"] = RULES["exp6"]
 CRITERIA["exp5_1gpu"], CRITERIA["exp6_1gpu"] = CRITERIA["exp5"], CRITERIA["exp6"]
+CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp5"]  # upper-body tracking is reported, not (yet) a pass criterion
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
 TRAIN_ARGS = ["--pi_gn_skip", "5"]
-IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01}
+IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01, "upper_med_err": -0.005}
 
 status = json.load(open(STATUS)) if os.path.exists(STATUS) else {}
 
@@ -302,6 +305,14 @@ if __name__ == "__main__":
         run_experiment("exp4", [ALL], loco, extra=["--ref_cmd_prob", "0"])
         run_experiment("exp4_resume", [ALL], loco, extra=["--ref_cmd_prob", "0"], init_from="exp3")
         log("exp4 done")
+    elif sys.argv[1:] == ["upper"]:  # exp7: exp5 + waist/arm targets in the velocity command, warm-started from exp5
+        loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
+        extra = ["--self_collision", "--upper_cmd", "--init_from", os.path.join(REPO, "logs", "exp5", "last.pt")]
+        st = run_experiment("exp7", [ALL], loco, per_gpu=False, gpus=[6, 7], extra=extra)
+        if st.get("runs", {}).get("exp7", {}).get("state") in ("diverged", "crashed"):
+            log(f"exp7: 2-GPU run {st['runs']['exp7']['state']}; retrying single-GPU as exp7_1gpu")
+            run_experiment("exp7_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
+        log("upper done")
     elif sys.argv[1:] == ["selfcol"]:  # self-collisions (train.py default since 1830e2c), one seed data parallel on GPUs 6+7
         loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
 
