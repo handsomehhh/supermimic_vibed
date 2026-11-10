@@ -11,7 +11,8 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 MJCF = os.path.join(ROOT, "data", "g1_description", "g1_29dof.xml")
 
 
-def two_robot_xml(offwidth: int = 1920, offheight: int = 1080) -> str:
+def two_robot_xml(offwidth: int = 1920, offheight: int = 1080, terrain=None) -> str:
+    """terrain: also show this heightfield map (call terrain.write_hfield on the compiled model)."""
     xml = open(MJCF).read()
     xml = re.sub(r'meshdir="[^"]*"', 'meshdir="' + os.path.join(ROOT, "data", "g1_description") + '/"', xml)
     body = xml[xml.index('<body name="pelvis"') : xml.index("</worldbody>")]
@@ -33,6 +34,14 @@ def two_robot_xml(offwidth: int = 1920, offheight: int = 1080) -> str:
     <texture name="sky" type="skybox" builtin="gradient" rgb1="0.95 0.96 0.98" rgb2="0.75 0.8 0.88" width="256" height="256"/>
     """
     xml = xml.replace("<asset>", "<asset>" + assets, 1)
+    if terrain is not None:
+        import sys
+
+        sys.path.insert(0, ROOT)
+        from supermimic.terrain import add_hfield
+
+        xml = add_hfield(xml, terrain, keep_floor=True)
+        xml = xml.replace('name="terrain" type="hfield"', 'name="terrain" type="hfield" rgba="0.62 0.66 0.72 1"', 1)
     if "<visual>" not in xml:
         xml = xml.replace("<asset>", f'<visual><global offwidth="{offwidth}" offheight="{offheight}"/><quality shadowsize="4096"/></visual>\n  <asset>', 1)
     return xml
