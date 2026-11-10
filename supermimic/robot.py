@@ -119,7 +119,7 @@ def default_joint_pos_list() -> list[float]:
 
 
 def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
-              collision: Literal["mesh", "proxy"] = "mesh", self_collision: bool = False,
+              collision: Literal["mesh", "proxy", "hybrid"] = "mesh", self_collision: bool = False,
               keep_floor: bool = False) -> mujoco.MjModel:
     """Free pelvis, position actuators, armature, plane or terrain.
 
@@ -128,7 +128,7 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
     pelvis_contour/pelvis, head/torso) stay excluded by MuJoCo's ``filterparent`` rule, which MuJoCo-Warp
     applies identically. No such pair touches in the default or the zero pose.
     """
-    if collision not in ("mesh", "proxy"):
+    if collision not in ("mesh", "proxy", "hybrid"):
         raise ValueError(f"Unknown collision mode: {collision}")
     xml = open(MJCF_PATH).read()
     acts = []
@@ -145,14 +145,20 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
 
         xml = add_hfield(xml, terrain, keep_floor=keep_floor)
     m = _compile(xml)
-    if collision == "proxy":
-        m = _compile(_proxy_xml(xml, m))
+    if collision in ("proxy", "hybrid"):
+        m = _compile(_proxy_xml(xml, m, duplicate=collision == "hybrid"))
     if terrain is not None:
         write_hfield(m, terrain)
     robot = m.geom_bodyid > 0
     m.geom_conaffinity[robot] = 0  # robot geoms collide with the floor only
+    if collision == "hybrid":
+        # mesh geoms (contype 1): floor plane and self-collisions as with collision="mesh"; their proxy copies
+        # (contype 2): the heightfield only, which accepts nothing else (conaffinity 2)
+        if terrain is not None:
+            m.geom_contype[m.geom("terrain" if keep_floor else "floor").id] = 0
+            m.geom_conaffinity[m.geom("terrain" if keep_floor else "floor").id] = 2
     if self_collision:
-        m.geom_conaffinity[robot & (m.geom_contype > 0)] = 1  # visual-only geoms (contype 0) stay out
+        m.geom_conaffinity[robot & (m.geom_contype == 1)] = 1  # visual-only (0) and hybrid proxy (2) geoms stay out
         assert not m.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_FILTERPARENT
     m.opt.timestep = timestep
     m.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
@@ -161,8 +167,10 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
     return m
 
 
-def _proxy_xml(xml: str, model: mujoco.MjModel) -> str:
+def _proxy_xml(xml: str, model: mujoco.MjModel, duplicate: bool = False) -> str:
     """Fit primitives in link coordinates; explicit URDF inertials stay untouched.
+
+    duplicate: keep every collision geom and add its primitives as copies with contype 2 / conaffinity 0.
 
     Mesh vertices are in MuJoCo's recentered principal frame, so transform them
     through the compiled geom pose before fitting. Visual meshes are retained.
@@ -175,6 +183,15 @@ def _proxy_xml(xml: str, model: mujoco.MjModel) -> str:
     for g, geom in enumerate(geoms):
         if model.geom_bodyid[g] == 0 or model.geom_contype[g] == 0:
             continue
+        if duplicate:
+            if model.geom_type[g] not in (mujoco.mjtGeom.mjGEOM_SPHERE, mujoco.mjtGeom.mjGEOM_MESH):
+                continue
+            original, geom = geom, deepcopy(geom)
+            parents[original].append(geom)
+            parents[geom] = parents[original]
+            geom.set("contype", "2")
+            geom.set("conaffinity", "0")
+            geom.attrib.pop("name", None)
         if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE:
             # 25 mm sole pads, preserving the bottom plane and a 9 cm width.
             # A 10 ms contact time constant prevents a pad center entering the

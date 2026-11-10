@@ -2,8 +2,10 @@
 
 Scene: the z = 0 floor plane (motion-tracking worlds, which follow their clips around the origin) plus a
 heightfield map placed away from the origin (velocity worlds). The map is mjlab's rough-terrain generator
-without random-rough tiles (terrain.mjlab_rough_cfg). Collision geometry is the proxy set (primitives; mesh
-collisions blow up on heightfields, PERCEPTION_MILESTONES P2).
+without random-rough tiles (terrain.mjlab_rough_cfg). Collision geometry is hybrid (robot.sim_model): the mesh
+geoms collide with the floor and with each other exactly as in the flat runs; primitive proxy copies collide with
+the heightfield only (mesh-heightfield contacts blow up, PERCEPTION_MILESTONES P2; proxy self-collisions
+overlap at the hips in the default pose).
 
 Velocity worlds: one tile per world (column = world index mod columns, level from the curriculum), spawned on
 the tile's center platform from a velocity-library state (yaw 0 on stairs, uniform elsewhere), 20 s episodes.
@@ -64,7 +66,7 @@ class TerrainSim(TrackingSim):
         st = self.setup
         self.map = generate(st.terrain, st.seed)
         self.hs = HeightSampler(self.map, self.device)
-        m = sim_model(timestep, terrain=self.map, collision="proxy", self_collision=self_collision, keep_floor=True)
+        m = sim_model(timestep, terrain=self.map, collision="hybrid", self_collision=self_collision, keep_floor=True)
         m.opt.ccd_iterations = 50
         m.opt.ccd_tolerance = 1e-4  # FP32 contact witnesses far from the origin
         return m
