@@ -102,6 +102,8 @@ class TerrainSim(TrackingSim):
         self.cam_params = self.cam.sample_params(N, noise=not self.eval_mode)
         self.depth_stack = torch.zeros(self.n_vel, st.camera.frames, *self.cam.shape, device=dev, dtype=torch.float16)
         self.tick = torch.ones(N, dtype=torch.bool, device=dev)
+        self.fresh = torch.zeros(N, dtype=torch.bool, device=dev)  # velocity worlds reset since their last frame
+        self._in_step = False
         lo = torch.tensor(self.map.offset, device=dev)
         self.map_lo = lo + st.bounds_margin
         self.map_hi = lo + torch.tensor(self.map.extent, device=dev) - st.bounds_margin
@@ -163,16 +165,28 @@ class TerrainSim(TrackingSim):
         self.start_xy[ids] = xy
 
     def _camera_reset(self, ids: torch.Tensor):
+        """New camera parameters; the first frame (filling the whole stack) comes with the next frame update."""
         if not len(ids):
             return
         self.cam_params[ids] = self.cam.sample_params(len(ids), noise=not self.eval_mode)
-        frame = self._render(ids)
-        self.depth_stack[ids - self.vel_lo] = frame.half().unsqueeze(1).expand(-1, self.setup.camera.frames, -1, -1)
+        self.fresh[ids] = True
         self.tick[ids] = True
+        if not self._in_step:  # resets outside step() (construction, evaluation) get their frame right away
+            self._update_frames(torch.zeros(self.N, dtype=torch.bool, device=self.device))
 
-    def _render(self, ids: torch.Tensor) -> torch.Tensor:
-        S = tuple(x[ids] for x in self.state())
-        return self.cam.render(S, self.cam_params[ids], noise=not self.eval_mode)
+    def _update_frames(self, tick: torch.Tensor):
+        """One fixed-size render of all velocity worlds (a fixed shape keeps the compiled renderer fast); worlds
+        reset since their last frame fill their stack with it, worlds at a tick push it."""
+        if not self.n_vel:
+            return
+        v = slice(self.vel_lo, self.N)
+        S = tuple(x[v] for x in self.state())
+        frame = self.cam.render(S, self.cam_params[v], noise=not self.eval_mode).half()
+        fresh, tick = self.fresh[v], tick[v] & ~self.fresh[v]
+        rolled = torch.cat((self.depth_stack[:, 1:], frame.unsqueeze(1)), 1)
+        filled = frame.unsqueeze(1).expand_as(self.depth_stack)
+        self.depth_stack = torch.where(fresh[:, None, None, None], filled, torch.where(tick[:, None, None, None], rolled, self.depth_stack))
+        self.fresh[v] = False
 
     # ------------------------------------------------------------------ commands
     def resample_cmd(self, env_ids: torch.Tensor):
@@ -256,20 +270,20 @@ class TerrainSim(TrackingSim):
         self.level[vel] = lvl
         self._update_info()
 
+    def step(self, a: torch.Tensor) -> dict:
+        self._in_step = True
+        try:
+            return super().step(a)
+        finally:
+            self._in_step = False
+
     def _post_step(self, done: torch.Tensor, ids: torch.Tensor | None):
         self.cmd_timer -= 1
         self._heading_control()
         self.cmd[:, :3] = torch.where((self.standing & self.is_vel)[:, None], 0.0, self.cmd[:, :3])
-        fresh = torch.zeros(self.N, dtype=torch.bool, device=self.device)
-        if ids is not None and len(ids):
-            fresh[ids] = True
         tick = is_tick(self.ep_step, self.cam_params[:, 9]) & self.is_vel
-        self.tick = torch.where(fresh, True, tick)
-        todo = (tick & ~fresh).nonzero(as_tuple=False).squeeze(-1)
-        if len(todo):
-            frame = self._render(todo).half()
-            j = todo - self.vel_lo
-            self.depth_stack[j] = torch.cat((self.depth_stack[j, 1:], frame.unsqueeze(1)), 1)
+        self.tick = tick | self.fresh
+        self._update_frames(tick)
 
     # ------------------------------------------------------------------ stats
     def level_stats(self) -> dict:

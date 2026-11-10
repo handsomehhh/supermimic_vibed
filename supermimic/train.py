@@ -389,13 +389,13 @@ def policy_update():
         if TERRAIN and t + 1 < HZ:
             # a 30 Hz frame of the imagined state arrives at its tick steps: render it (no gradient through the
             # image), encode it (gradient into the CNN) and push it onto the frame stack
+            # (all velocity rows are rendered at a fixed batch size, which keeps the compiled renderer fast)
+            frames = cam.render(tuple(x[BM:].detach() for x in S), cam_v, noise=True)
             tick = is_tick(k_v + t + 1, cam_v[:, 9]).nonzero(as_tuple=False).squeeze(-1)
-            if len(tick):
-                Sv = tuple(x[BM:][tick].detach() for x in S)
-                feat = pi.depth_features(cam.render(Sv, cam_v[tick], noise=True))
-                rolled = torch.cat((dfeat[tick, 1:], feat.unsqueeze(1)), 1)
-                dfeat = dfeat.index_copy(0, tick, rolled)
-                n_render += len(tick)
+            feat = pi.depth_features(frames[tick])
+            rolled = torch.cat((dfeat[tick, 1:], feat.unsqueeze(1)), 1)
+            dfeat = dfeat.index_copy(0, tick, rolled)
+            n_render += len(tick)
     stack = lambda xs, sl: torch.stack([x[sl] for x in xs]).flatten(0, 1)  # noqa: E731  (H*b, ...)
     mo, ve = slice(0, BM), slice(BM, None)
     r, d = reward_term(tuple(stack([St[i] for St in Ss], mo) for i in range(6)), stack(Fs, mo), stack(As, mo), stack(Aps, mo))

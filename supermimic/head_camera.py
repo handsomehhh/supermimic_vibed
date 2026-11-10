@@ -112,9 +112,11 @@ class HeadCamera:
         self.occ_center = torch.tensor(c, device=device)
         self.occ_radius = torch.tensor(r, device=device)
         self.shape = (cfg.height, cfg.width)
-        # fused kernels for the ray march and the occluder test (~8x faster); dynamic: the batch size varies per call
-        self.march = torch.compile(self._march, dynamic=True) if torch.device(device).type == "cuda" else self._march
-        self.occlude = torch.compile(self._occlude, dynamic=True) if torch.device(device).type == "cuda" else self._occlude
+        # fused kernels for the ray march and the occluder test (~8x faster than eager); static shapes (callers
+        # render fixed-size batches; dynamic-shape kernels were 3-4x slower)
+        cuda = torch.device(device).type == "cuda"
+        self.march = torch.compile(self._march, dynamic=False) if cuda else self._march
+        self.occlude = torch.compile(self._occlude, dynamic=False) if cuda else self._occlude
 
     # ------------------------------------------------------------------ randomization
     def sample_params(self, n: int, noise: bool = True) -> torch.Tensor:
