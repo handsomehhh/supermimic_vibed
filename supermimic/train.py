@@ -216,7 +216,9 @@ def _wm_rollout(s, a, xi):
     S = unflatten_state(s[:, 0])
     preds = []
     for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]), _terr(S))
+        with torch.no_grad():  # terrain features enter world-model training as inputs (no gradient through the FK)
+            terr = _terr(tuple(x.detach() for x in S)) if TERRAIN else None
+        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]), terr)
         preds.append(S)
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
