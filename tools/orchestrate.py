@@ -29,6 +29,7 @@ resumes unfinished runs from their last.pt. Status: logs/orchestrator.json.
                                         redone on GPU 6 (eval on 7) if the 2-GPU run diverges
   python tools/orchestrate.py upper     exp7: exp5 + waist/arm target command (--upper_cmd), warm-started
                                         from exp5's last.pt; GPUs 6+7, same single-GPU fallback
+  python tools/orchestrate.py upper_long  exp7 continued from its last.pt to max_iters (no plateau stop)
 """
 
 from __future__ import annotations
@@ -66,9 +67,9 @@ CRITERIA = {  # best evaluation must satisfy all
 STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hours": 30.0, "max_iters": 100_000}
 # exp6 trains to max_iters (no plateau stop) so its GPUs stay occupied; divergence still stops it
 RULES = {"exp6": {**STOP_RULES, "min_iters": STOP_RULES["max_iters"], "max_hours": 40.0}}
-RULES["exp6_1gpu"] = RULES["exp6"]
+RULES["exp6_1gpu"] = RULES["exp7_long"] = RULES["exp7_long_1gpu"] = RULES["exp6"]
 CRITERIA["exp5_1gpu"], CRITERIA["exp6_1gpu"] = CRITERIA["exp5"], CRITERIA["exp6"]
-CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp5"]  # upper-body tracking is reported, not (yet) a pass criterion
+CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp7_long"] = CRITERIA["exp7_long_1gpu"] = CRITERIA["exp5"]  # upper-body tracking is reported, not (yet) a pass criterion
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
 TRAIN_ARGS = ["--pi_gn_skip", "5"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01, "upper_med_err": -0.005}
@@ -313,6 +314,19 @@ if __name__ == "__main__":
             log(f"exp7: 2-GPU run {st['runs']['exp7']['state']}; retrying single-GPU as exp7_1gpu")
             run_experiment("exp7_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
         log("upper done")
+    elif sys.argv[1:] == ["upper_long"]:  # exp7 continued from its last.pt to max_iters (no plateau stop)
+        loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
+        extra = ["--self_collision", "--upper_cmd"]
+        for name in ("exp7_long", "exp7_long_1gpu"):  # a run dir without last.pt starts from exp7's
+            d = os.path.join(REPO, "logs", name)
+            if not os.path.exists(os.path.join(d, "last.pt")):
+                os.makedirs(d, exist_ok=True)
+                os.link(os.path.join(REPO, "logs", "exp7", "last.pt"), os.path.join(d, "last.pt"))
+        st = run_experiment("exp7_long", [ALL], loco, per_gpu=False, gpus=[6, 7], extra=extra)
+        if st.get("runs", {}).get("exp7_long", {}).get("state") in ("diverged", "crashed"):
+            log(f"exp7_long: 2-GPU run {st['runs']['exp7_long']['state']}; retrying single-GPU as exp7_long_1gpu")
+            run_experiment("exp7_long_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
+        log("upper_long done")
     elif sys.argv[1:] == ["selfcol"]:  # self-collisions (train.py default since 1830e2c), one seed data parallel on GPUs 6+7
         loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
 
