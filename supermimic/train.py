@@ -147,7 +147,7 @@ elif args.init_from:  # weights (with their normalizers) only; optimizers, itera
         if k not in ck0:  # ckpt_*.pt files hold pi and wm only; last.pt has the critics too
             continue
         own = m.state_dict()
-        keep, grown, grown_norms = {}, 0, set()
+        keep, grown = {}, 0
         for n, t in ck0[k].items():
             if n not in own:
                 continue
@@ -163,10 +163,8 @@ elif args.init_from:  # weights (with their normalizers) only; optimizers, itera
                 v = o.clone()
                 v[: t.shape[0]] = t
                 keep[n], grown = v, grown + 1
-                grown_norms.add(n.rsplit(".", 1)[0])
-        for prefix in grown_norms:  # a grown normalizer must keep adapting (they freeze at 2e8 samples)
-            if prefix + ".count" in keep:
-                keep[prefix + ".count"] = torch.clamp(keep[prefix + ".count"], max=1e6)
+        # grown normalizers keep their (frozen) statistics: new trailing inputs stay at mean 0 / var 1, and the
+        # pretrained inputs keep exactly the scaling the pretrained weights expect
         m.load_state_dict(keep, strict=False)
         loaded.append(f"{k} {len(keep)}/{len(own)}" + (f" ({grown} grown)" if grown else ""))
     if MAIN:
