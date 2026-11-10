@@ -30,6 +30,8 @@ resumes unfinished runs from their last.pt. Status: logs/orchestrator.json.
   python tools/orchestrate.py upper     exp7: exp5 + waist/arm target command (--upper_cmd), warm-started
                                         from exp5's last.pt; GPUs 6+7, same single-GPU fallback
   python tools/orchestrate.py upper_long  exp7 continued from its last.pt to max_iters (no plateau stop)
+  python tools/orchestrate.py terrain [ckpt]  exp8: exp7 + terrain (mjlab stairs/slopes/flat) + head depth camera,
+                                        warm-started from ckpt (default logs/exp7/last.pt); GPUs 6+7, 1-GPU fallback
 """
 
 from __future__ import annotations
@@ -69,10 +71,13 @@ STOP_RULES = {"min_iters": 20_000, "patience": 6, "nogo_iters": 30_000, "max_hou
 RULES = {"exp6": {**STOP_RULES, "min_iters": STOP_RULES["max_iters"], "max_hours": 40.0}}
 RULES["exp6_1gpu"] = RULES["exp7_long"] = RULES["exp7_long_1gpu"] = RULES["exp6"]
 CRITERIA["exp5_1gpu"], CRITERIA["exp6_1gpu"] = CRITERIA["exp5"], CRITERIA["exp6"]
-CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp7_long"] = CRITERIA["exp7_long_1gpu"] = CRITERIA["exp5"]  # upper-body tracking is reported, not (yet) a pass criterion
+CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp7_long"] = CRITERIA["exp7_long_1gpu"] = CRITERIA["exp5"]
+# exp8 (terrain + head depth): flat criteria plus half of the terrain traversal trials (all tile types and levels)
+CRITERIA["exp8"] = CRITERIA["exp8_1gpu"] = {**CRITERIA["exp5"], "terrain_success": (">=", 0.5)}  # upper-body tracking is reported, not (yet) a pass criterion
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
 TRAIN_ARGS = ["--pi_gn_skip", "5"]
-IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01, "upper_med_err": -0.005}
+IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01, "upper_med_err": -0.005,
+           "terrain_success": +0.01}
 
 status = json.load(open(STATUS)) if os.path.exists(STATUS) else {}
 
@@ -314,6 +319,15 @@ if __name__ == "__main__":
             log(f"exp7: 2-GPU run {st['runs']['exp7']['state']}; retrying single-GPU as exp7_1gpu")
             run_experiment("exp7_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
         log("upper done")
+    elif sys.argv[1:2] == ["terrain"]:  # exp8: exp7 on terrain with the head depth camera, warm-started from a checkpoint
+        init = sys.argv[2] if len(sys.argv) > 2 else os.path.join(REPO, "logs", "exp7", "last.pt")
+        loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
+        extra = ["--self_collision", "--upper_cmd", "--terrain", "--init_from", init]
+        st = run_experiment("exp8", [ALL], loco, per_gpu=False, gpus=[6, 7], extra=extra)
+        if st.get("runs", {}).get("exp8", {}).get("state") in ("diverged", "crashed"):
+            log(f"exp8: 2-GPU run {st['runs']['exp8']['state']}; retrying single-GPU as exp8_1gpu")
+            run_experiment("exp8_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
+        log("terrain done")
     elif sys.argv[1:] == ["upper_long"]:  # exp7 continued from its last.pt to max_iters (no plateau stop)
         loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
         extra = ["--self_collision", "--upper_cmd"]

@@ -60,6 +60,9 @@ parser.add_argument("--self_collision", action=argparse.BooleanOptionalAction, d
                     help="collisions between non-adjacent robot links (exp1-exp4 ran without: --no-self_collision)")
 parser.add_argument("--upper_cmd", action="store_true",
                     help="velocity interface also takes waist/arm target positions (+ per-group tracking flags) and tracks them")
+parser.add_argument("--terrain", action="store_true",
+                    help="velocity interface on mjlab-style terrain with the head depth camera (terrain_env.TerrainSim)")
+parser.add_argument("--terrain_seed", type=int, default=0)
 parser.add_argument("--init_from", type=str, default=None,
                     help="start from this checkpoint's world model, motion encoder, decoder and motion critic; modules whose "
                          "shapes changed (velocity encoder/critic under --upper_cmd) and the policy optimizer start fresh")
@@ -113,10 +116,18 @@ if MAIN:
     print(f"[motion] {motion.num_clips} clips, {motion.num_frames / 50 / 3600:.2f} h; motion clips {int(motion.in_motion.sum())}, "
           f"loco clips {int(motion.in_loco.sum())}; body cache {motion.cached_bodies}; world {WORLD}, lr {LR:.2e}", flush=True)  # fmt: skip
 
-wm = WorldModel().to(dev)
-pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim).to(dev)
+TERRAIN = args.terrain and VEL
+if TERRAIN:
+    from supermimic.head_camera import CAM_PARAM_DIM, decode_u8, is_tick
+    from supermimic.terrain_env import TerrainSetup, TerrainSim
+    from supermimic.terrain_mdp import TERRAIN_FEAT_DIM, terrain_critic_dim
+
+    SETUP = TerrainSetup(seed=args.terrain_seed)
+    NFR = SETUP.camera.frames
+wm = WorldModel(terrain_dim=TERRAIN_FEAT_DIM if TERRAIN else 0).to(dev)
+pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim, depth_frames=NFR if TERRAIN else 0).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
-critic_v = Critic(vel_critic_dim(args.upper_cmd)).to(dev)
+critic_v = Critic(terrain_critic_dim(args.upper_cmd) if TERRAIN else vel_critic_dim(args.upper_cmd)).to(dev)
 opt_wm = torch.optim.Adam(wm.parameters(), lr=LR)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=LR, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=LR)
@@ -136,9 +147,28 @@ elif args.init_from:  # weights (with their normalizers) only; optimizers, itera
         if k not in ck0:  # ckpt_*.pt files hold pi and wm only; last.pt has the critics too
             continue
         own = m.state_dict()
-        keep = {n: t for n, t in ck0[k].items() if n in own and own[n].shape == t.shape}
+        keep, grown, grown_norms = {}, 0, set()
+        for n, t in ck0[k].items():
+            if n not in own:
+                continue
+            o = own[n]
+            if o.shape == t.shape:
+                keep[n] = t
+            elif o.dim() == 2 and t.dim() == 2 and o.shape[0] == t.shape[0] and o.shape[1] > t.shape[1]:
+                # input layer that gained trailing inputs (terrain features, depth latent): old columns, new ones zero
+                w = torch.zeros_like(o)
+                w[:, : t.shape[1]] = t
+                keep[n], grown = w, grown + 1
+            elif o.dim() == 1 and t.dim() == 1 and o.shape[0] > t.shape[0]:  # normalizer statistics: prefix
+                v = o.clone()
+                v[: t.shape[0]] = t
+                keep[n], grown = v, grown + 1
+                grown_norms.add(n.rsplit(".", 1)[0])
+        for prefix in grown_norms:  # a grown normalizer must keep adapting (they freeze at 2e8 samples)
+            if prefix + ".count" in keep:
+                keep[prefix + ".count"] = torch.clamp(keep[prefix + ".count"], max=1e6)
         m.load_state_dict(keep, strict=False)
-        loaded.append(f"{k} {len(keep)}/{len(own)}")
+        loaded.append(f"{k} {len(keep)}/{len(own)}" + (f" ({grown} grown)" if grown else ""))
     if MAIN:
         print(f"[init] from {args.init_from} (it {ck0['iteration']}), tensors loaded: " + ", ".join(loaded), flush=True)
     del ck0
@@ -180,11 +210,15 @@ ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.ful
                        torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
 
 
+def _terr(S):
+    return task.features(S) if TERRAIN else None
+
+
 def _wm_rollout(s, a, xi):
     S = unflatten_state(s[:, 0])
     preds = []
     for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]))
+        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]), _terr(S))
         preds.append(S)
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
@@ -196,20 +230,21 @@ def _wm_err(S_hat, s1, mask):
     return (e * mask).sum() / s1.shape[0], e[:, -1]
 
 
-def _imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref):
-    """One imagined step; rows [0, BM) use the motion interface, rows [BM, B) the velocity interface."""
+def _imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref, dfeat=None):
+    """One imagined step; rows [0, BM) use the motion interface, rows [BM, B) the velocity interface.
+    dfeat: (BV, frames, feat) depth features of the velocity rows (terrain)."""
     g = mdp.motion_goal(S[1], f, K)
     a = pi.decode(pi.z_motion(g[:BM]), o_hist[:BM])
     align = torch.zeros((), device=f.device)
     if VEL:
-        zv = pi.z_vel(o_hist[BM:], mdp.norm_cmd(cmd[BM:]))
+        zv = pi.z_vel(o_hist[BM:], mdp.norm_cmd(cmd[BM:]), dfeat)
         av = pi.decode(zv, o_hist[BM:], frozen=True)
         with torch.no_grad():
             zt = pi.z_motion(g[BM:])
         m = cmd_ref[BM:].float()
         align = (((zv - zt) ** 2).mean(-1) * m).sum() / m.sum().clamp(min=1)
         a = torch.cat((a, av), 0)
-    S1 = wm.step(S, a, xi_n)
+    S1 = wm.step(S, a, xi_n, _terr(S))
     f1 = torch.minimum(f + 1, motion.clip_end[motion.clip_id[f]])
     o1 = mdp.add_noise(mdp.obs(S1, a, xi))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
@@ -221,7 +256,9 @@ def _reward_term(S, f, a, a_prev):
     return mdp.reward(S, f, a, a_prev), mdp.soft_termination(S, f)
 
 
-def _vel_reward_term(S, cmd, a, a_prev):
+def _vel_reward_term(S, cmd, a, a_prev, info=None):
+    if TERRAIN:
+        return task.reward(S, cmd, a, a_prev, info), task.soft_fall(S)
     return mdp.vel_reward(S, cmd, a, a_prev), mdp.soft_fall(S)
 
 
@@ -230,6 +267,8 @@ def _critic_input(S, f, xi_n):
 
 
 def _vel_critic_input(S, cmd, xi_n):
+    if TERRAIN:
+        return task.critic_features(S, cmd, xi_n, task.features(S))
     return mdp.vel_critic_features(S, cmd, xi_n)
 
 
@@ -267,10 +306,13 @@ def wm_update():
 
 def sample_valid_starts(B: int, env_lo: int, env_hi: int):
     starts, hists, n = [], [], 0
+    terrain_vel = TERRAIN and env_lo >= N_MO
     while n < B:
-        s, h = buffer.sample_starts(2 * B, Hh, env_lo, env_hi)
+        s, h = buffer.sample_starts(2 * B, Hh, env_lo, env_hi, depth_window=20 if terrain_vel else 0)
         f = s["f"]
-        ok = (f + HZ <= motion.clip_end[motion.clip_id[f]]) & s["valid"]
+        in_clip = f + HZ <= motion.clip_end[motion.clip_id[f]]
+        # terrain velocity worlds run past their spawn clip; only reference commands need the clip ahead
+        ok = (in_clip | (~s["cmd_ref"] if terrain_vel else torch.zeros_like(in_clip))) & s["valid"]
         idx = ok.nonzero(as_tuple=False).squeeze(-1)[: B - n]
         starts.append({k: v[idx] for k, v in s.items()}), hists.append({k: v[idx] for k, v in h.items()})
         n += len(idx)
@@ -320,9 +362,15 @@ gn_level = [None, 0]
 def policy_update():
     sm, hm = sample_valid_starts(BM, 0, N_MO)
     sv, hv = sample_valid_starts(BV, N_MO, args.num_envs) if VEL else ([], [])
-    cat = lambda ds: {k: torch.cat([d[k] for d in ds]) for k in ds[0]}  # noqa: E731
+    cat = lambda ds: {k: torch.cat([d[k] for d in ds]) for k in ds[0] if all(k in e for e in ds)}  # noqa: E731
     s, h = cat(sm + sv), cat(hm + hv)
     S = unflatten_state(s["s"])
+    dfeat = None
+    if TERRAIN:
+        sv_c = cat(sv)
+        info_v, cam_v = sv_c["info"], sv_c["cam"]
+        k_v = sv_c["ep_step"].long()  # control step since reset of the start state
+        dfeat = pi.depth_features(decode_u8(sv_c["depth"]))  # (BV, frames, feat), with gradient into the CNN
     xi, f, cmd, cmd_ref = s["xi"], s["f"], s["cmd"], s["cmd_ref"]
     a_prev = s["a_prev"]
     xi_n = normalize_xi(xi)
@@ -334,11 +382,22 @@ def policy_update():
     set_requires_grad(critic_v, False)
     S0, f0, cmd0 = S, f, cmd
     Ss, As, Aps, Fs, Cs, align = [], [], [], [], [], 0.0
+    n_render = 0
     for t in range(HZ):
         Aps.append(a_prev), Cs.append(cmd)
-        S, a_prev, o_hist, f, cmd, al = imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref)
+        S, a_prev, o_hist, f, cmd, al = imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref, dfeat)
         Ss.append(S), As.append(a_prev), Fs.append(f)
         align = align + al / HZ
+        if TERRAIN and t + 1 < HZ:
+            # a 30 Hz frame of the imagined state arrives at its tick steps: render it (no gradient through the
+            # image), encode it (gradient into the CNN) and push it onto the frame stack
+            tick = is_tick(k_v + t + 1, cam_v[:, 9]).nonzero(as_tuple=False).squeeze(-1)
+            if len(tick):
+                Sv = tuple(x[BM:][tick].detach() for x in S)
+                feat = pi.depth_features(cam.render(Sv, cam_v[tick], noise=True))
+                rolled = torch.cat((dfeat[tick, 1:], feat.unsqueeze(1)), 1)
+                dfeat = dfeat.index_copy(0, tick, rolled)
+                n_render += len(tick)
     stack = lambda xs, sl: torch.stack([x[sl] for x in xs]).flatten(0, 1)  # noqa: E731  (H*b, ...)
     mo, ve = slice(0, BM), slice(BM, None)
     r, d = reward_term(tuple(stack([St[i] for St in Ss], mo) for i in range(6)), stack(Fs, mo), stack(As, mo), stack(Aps, mo))
@@ -348,7 +407,8 @@ def policy_update():
     loss = -J.mean()
     out = {"imag_rew": (r_sum / HZ / MAX_STEP_REWARD).mean(), "surv": c.mean().detach()}
     if VEL:
-        rv, dv = vel_reward_term(tuple(stack([St[i] for St in Ss], ve) for i in range(6)), stack(Cs, ve), stack(As, ve), stack(Aps, ve))
+        info_h = info_v.unsqueeze(0).expand(HZ, -1, -1).flatten(0, 1) if TERRAIN else None
+        rv, dv = vel_reward_term(tuple(stack([St[i] for St in Ss], ve) for i in range(6)), stack(Cs, ve), stack(As, ve), stack(Aps, ve), info_h)
         rv, dv = rv.view(HZ, BV), dv.view(HZ, BV)
         Jv, cv, rv_sum = discounted_objective(rv, dv)
         Jv = Jv + (args.gamma**HZ) * cv * critic_v(_vel_critic_input(tuple(x[ve] for x in S), cmd[ve], xi_n[ve]))
@@ -393,14 +453,24 @@ def policy_update():
             targets = gae_targets(critic_v(X), rv.detach(), dv.detach())
         out["v_loss_v"] = fit_critic(critic_v, opt_vv, X, targets)
     out.update(pi=loss.detach(), gn=gn.detach(), gn_enc=gparts["enc"], gn_enc_vel=gparts["enc_vel"], gn_dec=gparts["dec"],
-               pi_skip=torch.tensor(float(skip), device=dev))  # fmt: skip
+               pi_skip=torch.tensor(float(skip), device=dev), renders=torch.tensor(float(n_render), device=dev))  # fmt: skip
     return out
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp, ref_cmd_prob=args.ref_cmd_prob,
-                  self_collision=args.self_collision)
-buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, cmd_dim=mdp.cmd_dim)
+SIM_KW = dict(gamma=args.gamma, n_vel=N_VEL, reset_temp=args.reset_temp, ref_cmd_prob=args.ref_cmd_prob, self_collision=args.self_collision)
+if TERRAIN:
+    env = TerrainSim(args.num_envs, motion, mdp, dev, setup=SETUP, **SIM_KW)
+    task, cam = env.task, env.cam
+    MAX_STEP_REWARD_VEL = task.max_step_reward
+    buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, cmd_dim=mdp.cmd_dim, terrain_vel=N_VEL, cam_dim=CAM_PARAM_DIM,
+                          frames=NFR, image=cam.shape)  # fmt: skip
+    if MAIN:
+        print(f"[terrain] map {env.map.heights.shape} cells at {env.map.resolution} m, {env.origins.shape[0]} levels x "
+              f"{env.origins.shape[1]} columns; velocity worlds {N_VEL}/{args.num_envs} per GPU", flush=True)  # fmt: skip
+else:
+    env = TrackingSim(args.num_envs, motion, mdp, dev, **SIM_KW)
+    buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, cmd_dim=mdp.cmd_dim)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 is_vel = env.is_vel
 
@@ -418,13 +488,14 @@ def collect(n_steps: int, stats: dict):
         pi.goal_norm.update(g)
         a = pi(obs_hist[:N_MO], g[:N_MO])
         if VEL:
-            a = torch.cat((a, pi.act_vel(obs_hist[N_MO:], mdp.norm_cmd(env.cmd[N_MO:]))), 0)
+            depth = env.depth_stack.float() if TERRAIN else None
+            a = torch.cat((a, pi.act_vel(obs_hist[N_MO:], mdp.norm_cmd(env.cmd[N_MO:]), depth)), 0)
         a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
         out = env.step(a)
         buffer.add(out)
         ok = out["valid"]
         S0, S1 = unflatten_state(out["s"][ok]), unflatten_state(out["s1"][ok])
-        wm.in_norm.update(wm.inputs(S0, out["a"][ok], normalize_xi(out["xi"][ok])))
+        wm.in_norm.update(wm.inputs(S0, out["a"][ok], normalize_xi(out["xi"][ok]), _terr(S0)))
         wm.out_norm.update(wm.targets(S0, S1))
         stats["blown"].append(out["n_blown"])
         sim_steps += args.num_envs * WORLD
@@ -437,6 +508,8 @@ def collect(n_steps: int, stats: dict):
                 tracked = out["cmd"][N_MO:, -3:].sum(-1) > 0
                 e = mdp.upper_err(S1v[4], out["cmd"][N_MO:])[1]
                 stats["upper_err"].append((e * tracked).sum() / tracked.sum().clamp(min=1))
+        if TERRAIN:
+            stats["level"].append(env.level[N_MO:].float().mean())
         if "ep_len" in out:
             for key, sel in (("", ~out["done_vel"]), ("_v", out["done_vel"])):
                 ids = out["done_ids"][sel]
@@ -444,13 +517,13 @@ def collect(n_steps: int, stats: dict):
                 stats["term" + key].append(out["term"][ids].float().sum()), stats["done" + key].append(sel.float().sum())
 
 
-STAT_KEYS = ["blown", "r", "r_v", "cmd_err", "upper_err", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
+STAT_KEYS = ["blown", "r", "r_v", "cmd_err", "upper_err", "level", "ep_len", "ep_ret", "term", "done", "ep_len_v", "ep_ret_v", "term_v", "done_v"]
 stats = {k: [] for k in STAT_KEYS}
 collect(args.warmup_steps, stats)  # the replay buffer is not checkpointed: refill it on resume too
 COLS = ["iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm", "imag_survival",
         "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "v_loss_v", "imag_rew_v", "imag_survival_v", "align",
         "sim_rew_v", "cmd_err", "ep_len_v", "ep_ret_norm_v", "fall_frac_v", "it_per_s", "lr", "sim_blowups", "gn_enc",
-        "gn_enc_vel", "gn_dec", "pi_skip_frac", "rollbacks", "pi_lr_mult", "upper_err"]  # fmt: skip
+        "gn_enc_vel", "gn_dec", "pi_skip_frac", "rollbacks", "pi_lr_mult", "upper_err", "terrain_level", "imag_renders"]  # fmt: skip
 if MAIN:
     new_log = not os.path.exists(os.path.join(args.log_dir, "train_log.csv"))
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
@@ -553,14 +626,15 @@ for it in range(start_it, args.iterations):
                    mean("surv"), smean("r"), ssum("ep_len") / dn, ssum("ep_ret") / dn, ssum("term") / dn, mean("v_loss_v"),
                    mean("imag_rew_v"), mean("surv_v"), mean("align"), smean("r_v"), smean("cmd_err"), ssum("ep_len_v") / dv,
                    ssum("ep_ret_v") / dv, ssum("term_v") / dv, ips, lr, ssum("blown"), mean("gn_enc"), mean("gn_enc_vel"),
-                   mean("gn_dec"), mean("pi_skip"), rb["count"], rb["lr_mult"], smean("upper_err")]  # fmt: skip
+                   mean("gn_dec"), mean("pi_skip"), rb["count"], rb["lr_mult"], smean("upper_err"), smean("level"), mean("renders")]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
             r = dict(zip(COLS, row))
             print(f"it {it + 1} | {wall_h:.3f} h | wm {r['wm_loss']:.4f} e8 {r['wm_err8']:.4f} | pi {r['pi_loss']:.3f} imag_r {r['imag_rew']:.3f} "
                   f"surv {r['imag_survival']:.3f} | sim_r {r['sim_rew']:.3f} ep_ret {r['ep_ret_norm']:.3f} term {r['term_frac']:.2f} | "
                   f"vel: imag_r {r['imag_rew_v']:.3f} sim_r {r['sim_rew_v']:.3f} cmd_err {r['cmd_err']:.3f} fall {r['fall_frac_v']:.2f} "
-                  f"align {r['align']:.4f}" + (f" upper_err {r['upper_err']:.3f}" if args.upper_cmd else "") + f" | blowups {int(r['sim_blowups'])} | {ips:.2f} it/s", flush=True)  # fmt: skip
+                  f"align {r['align']:.4f}" + (f" upper_err {r['upper_err']:.3f}" if args.upper_cmd else "")
+                  + (f" level {r['terrain_level']:.2f}" if TERRAIN else "") + f" | blowups {int(r['sim_blowups'])} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in STAT_KEYS}
         agg = {}
         if bool(stop):

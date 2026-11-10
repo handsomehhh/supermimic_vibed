@@ -99,14 +99,15 @@ def unflatten_state(x: torch.Tensor):
     return x[..., 0:3], quat_to_mat(x[..., 3:7]), x[..., 7:10], x[..., 10:13], x[..., 13:42], x[..., 42:71]
 
 
-def invariant_features(S) -> torch.Tensor:
-    """Heading- and position-invariant state features: height, tilt (6D), body-frame velocities, joints."""
+def invariant_features(S, ground_z: torch.Tensor | None = None) -> torch.Tensor:
+    """Heading- and position-invariant state features: height (above the ground under the pelvis if
+    ``ground_z`` is given; on the flat floor ground_z = 0), tilt (6D), body-frame velocities, joints."""
     p, R, v, w, q, qd = S
     H = yaw_mat(R)
     Rt = R.transpose(-1, -2)
     return torch.cat(
         (
-            p[..., 2:3],
+            p[..., 2:3] if ground_z is None else (p[..., 2] - ground_z).unsqueeze(-1),
             mat_to_6d(H.transpose(-1, -2) @ R),
             (Rt @ v.unsqueeze(-1)).squeeze(-1),
             (Rt @ w.unsqueeze(-1)).squeeze(-1),

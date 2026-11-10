@@ -13,6 +13,10 @@ trials each; the per-command value is the median over the trials that did not fa
 waist and arms untracked (comparable to runs without it), the second half track the waist/arm pose of a
 fixed random motion-library frame per command; ``upper_med_err`` is the median over those non-falling
 trials of the mean |joint error| (rad) over the last 2 s, and the velocity error is also reported per half.
+Runs with ``terrain``: all simulators are the terrain scene (motion clips on the floor around the origin, the
+step test on the floor with the head camera), plus a traversal test: on every tile type x 10 levels x 4 trials,
+from the tile center facing +x, a 0.8 m/s forward command for 10 s; success = 3.5 m out (past the last step or
+the slope) without falling. Raised pyramids (stairs_up, slope_up) test descending, pits test ascending.
 
 Run as a watcher: ``python supermimic/evaluate.py --run_dir logs/<run> --watch``.
 """
@@ -77,7 +81,16 @@ mo_ids = subset(motion.in_motion, args.max_clips)
 lo_ids = subset(motion.in_loco, args.max_loco_clips) if VEL else torch.zeros(0, dtype=torch.long)
 clip_ids = torch.cat((mo_ids, lo_ids)).to(dev)
 n_mo = len(mo_ids)
-env_m = TrackingSim(len(clip_ids), motion, mdp, dev, eval_mode=True, self_collision=SELF_COL)
+TERRAIN = run_args.get("terrain", False) and VEL
+if TERRAIN:
+    from supermimic.terrain import TILE_TYPES
+    from supermimic.terrain_env import TerrainSetup, TerrainSim
+
+    SETUP = TerrainSetup(seed=run_args.get("terrain_seed", 0))
+    Sim = lambda n, n_vel=0: TerrainSim(n, motion, mdp, dev, eval_mode=True, n_vel=n_vel, self_collision=SELF_COL, setup=SETUP)  # noqa: E731
+else:
+    Sim = lambda n, n_vel=0: TrackingSim(n, motion, mdp, dev, eval_mode=True, n_vel=n_vel, self_collision=SELF_COL)  # noqa: E731
+env_m = Sim(len(clip_ids))
 
 
 def step_test_commands():
@@ -94,8 +107,7 @@ def step_test_commands():
 
 if VEL:
     CMDS = step_test_commands().to(dev)
-    env_v = TrackingSim(len(CMDS) * args.trials, motion, mdp, dev, eval_mode=True, n_vel=len(CMDS) * args.trials,
-                        self_collision=SELF_COL)
+    env_v = Sim(len(CMDS) * args.trials, len(CMDS) * args.trials)
     longest = motion.clip_start[torch.argmax(torch.where(motion.in_loco, motion.clip_len, 0))]
     n_tr = len(CMDS) * args.trials
     CMDS_FULL = mdp.full_cmd(CMDS.repeat(args.trials, 1))  # (trials * commands, cmd_dim), trial-major
@@ -110,7 +122,7 @@ if VEL:
 
 def load_policy(ck: dict) -> Policy:
     networks.AMP_DTYPE = torch.bfloat16 if ck["args"].get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K + REL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim).to(dev)
+    pi = Policy(OBS_DIM, 73 * K + REL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim, depth_frames=SETUP.camera.frames if TERRAIN else 0).to(dev)
     pi.load_state_dict(ck["pi"])
     return pi.eval()
 
@@ -160,7 +172,7 @@ def eval_velocity(pi: Policy) -> dict:
         S = env.state()
         o = mdp.obs(S, env.a_prev, env.xi)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        env.step(pi.act_vel(hist, mdp.norm_cmd(env.cmd)))
+        env.step(pi.act_vel(hist, mdp.norm_cmd(env.cmd), env.depth_stack.float() if TERRAIN else None))
         S1 = env.state()
         fell |= mdp.fall(S1)
         if t >= 150:
@@ -188,11 +200,54 @@ def eval_velocity(pi: Policy) -> dict:
     return res
 
 
+if TERRAIN:
+    _cols = env_v.kinds_map[0]
+    T_KINDS = [k for k in range(len(TILE_TYPES)) if bool((_cols == k).any())]
+    T_LEVELS, T_TRIALS = env_v.origins.shape[0], 4
+    n_t = len(T_KINDS) * T_LEVELS * T_TRIALS
+    env_t = Sim(n_t, n_t)
+    _k = torch.tensor(T_KINDS, device=dev).repeat_interleave(T_LEVELS * T_TRIALS)
+    T_COL = torch.stack([(_cols == k).nonzero()[0, 0] for k in _k.tolist()])
+    T_LEVEL = torch.arange(T_LEVELS, device=dev).repeat_interleave(T_TRIALS).repeat(len(T_KINDS))
+
+
+@torch.no_grad()
+def eval_terrain(pi: Policy) -> dict:
+    env = env_t
+    n = env.N
+    ids = torch.arange(n, device=dev)
+    env.done_eval[:] = False
+    env.failed_eval[:] = False
+    env.reset_on_tile(ids, T_COL, T_LEVEL, torch.zeros(n, device=dev), longest.expand(n).clone())
+    env.cmd[:] = mdp.full_cmd(torch.tensor([[0.8, 0.0, 0.0]], device=dev).expand(n, 3))
+    env.cmd_ref[:] = False
+    start = env.qpos[:, :2].clone()
+    fell = torch.zeros(n, dtype=torch.bool, device=dev)
+    reached = torch.zeros(n, dtype=torch.bool, device=dev)
+    hist = None
+    for t in range(500):
+        S = env.state()
+        o = mdp.obs(S, env.a_prev, env.xi)
+        hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
+        env.step(pi.act_vel(hist, mdp.norm_cmd(env.cmd), env.depth_stack.float()))
+        S1 = env.state()
+        fell |= env.task.fall(S1) & ~reached
+        reached |= ((S1[0][:, :2] - start).norm(dim=-1) >= 3.5) & ~fell
+    ok = (reached & ~fell).float().view(len(T_KINDS), T_LEVELS, T_TRIALS)
+    res = {"terrain_success": ok.mean().item()}
+    for i, k in enumerate(T_KINDS):
+        res[f"terrain_{TILE_TYPES[k]}"] = ok[i].mean().item()
+        res[f"terrain_{TILE_TYPES[k]}_levels"] = [round(x, 2) for x in ok[i].mean(-1).tolist()]
+    return res
+
+
 def evaluate(ck: dict) -> dict:
     pi = load_policy(ck)
     res = eval_motion(pi)
     if VEL:
         res.update(eval_velocity(pi))
+    if TERRAIN:
+        res.update(eval_terrain(pi))
     return res
 
 
@@ -200,6 +255,8 @@ COLS = ["iteration", "train_wall_h", "saved_at", "eval_at", "norm_return", "fail
         "loco_fail_rate", "vel_med_err", "vel_mean_err", "vel_fall_rate", "vel_cmds_all_fell"]  # fmt: skip
 if UPPER_CMD:
     COLS += ["upper_med_err", "vel_med_err_free", "vel_med_err_up", "vel_fall_rate_up"]
+if TERRAIN:
+    COLS += ["terrain_success"] + [f"terrain_{TILE_TYPES[k]}" for k in T_KINDS]
 
 if args.ckpt:
     res = evaluate(torch.load(args.ckpt, map_location=dev))
@@ -228,6 +285,7 @@ while True:
               + (f" | vel med err {res['vel_med_err']:.3f}, fall {res['vel_fall_rate']:.3f}" if VEL else "")
               + (f" | upper err {res['upper_med_err']:.3f} rad, vel err free/upper {res['vel_med_err_free']:.3f}/{res['vel_med_err_up']:.3f}"
                  if VEL and UPPER_CMD else "")
+              + (" | terrain " + ", ".join(f"{TILE_TYPES[k]} {res[f'terrain_{TILE_TYPES[k]}']:.2f}" for k in T_KINDS) if TERRAIN else "")
               + f" ({time.time() - t0:.0f}s)", flush=True)  # fmt: skip
         done.add(it)
     if not args.watch:

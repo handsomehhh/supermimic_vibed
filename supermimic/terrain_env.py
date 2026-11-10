@@ -1,0 +1,275 @@
+"""TrackingSim with the velocity interface on terrain and a head depth camera (motion tracking stays on the floor).
+
+Scene: the z = 0 floor plane (motion-tracking worlds, which follow their clips around the origin) plus a
+heightfield map placed away from the origin (velocity worlds). The map is mjlab's rough-terrain generator
+without random-rough tiles (terrain.mjlab_rough_cfg). Collision geometry is the proxy set (primitives; mesh
+collisions blow up on heightfields, PERCEPTION_MILESTONES P2).
+
+Velocity worlds: one tile per world (column = world index mod columns, level from the curriculum), spawned on
+the tile's center platform from a velocity-library state (yaw 0 on stairs, uniform elsewhere), 20 s episodes.
+Commands follow mjlab's UniformVelocityCommand (resampled every 3-8 s; 10% standing, 30% heading control
+with stiffness 0.5, 20% forward; forward-only with heading 0 on stairs) at its final curriculum ranges
+vx (-0.8, 1.0), vy (-0.7, 0.7), yaw (-0.7, 0.7); flat tiles keep the flat-ground interface's commands
+(reference commands and the full ranges). Terrain-level curriculum as mjlab terrain_levels_vel.
+Reward, fall and timeout: terrain_mdp.TerrainTask; out of the map's interior ends the episode (timeout).
+Depth: head_camera.HeadCamera at 30 Hz, a 10-frame stack per velocity world.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import math
+
+import torch
+
+from .env import TrackingSim
+from .head_camera import CAM_PARAM_DIM, HeadCamera, HeadCameraCfg, encode_u8, is_tick
+from .robot import sim_model
+from .rotations import axis_angle_to_mat
+from .terrain import TILE_TYPES, HeightSampler, TerrainCfg, generate, mjlab_rough_cfg
+from .terrain_mdp import STAIRS, TerrainRewardCfg, TerrainTask
+
+FLAT_KIND, STAIR_KINDS = TILE_TYPES.index("flat"), (TILE_TYPES.index("stairs_up"), TILE_TYPES.index("stairs_down"))
+
+
+@dataclass
+class TerrainSetup:
+    terrain: TerrainCfg = field(default_factory=lambda: mjlab_rough_cfg(map_origin=(60.0, -85.0), base_height=1.5))
+    seed: int = 0
+    camera: HeadCameraCfg = field(default_factory=HeadCameraCfg)
+    reward: TerrainRewardCfg = field(default_factory=TerrainRewardCfg)
+    max_init_level: int = 5
+    episode_steps: int = 1000  # 20 s
+    cmd_x: tuple[float, float] = (-0.8, 1.0)
+    cmd_y: tuple[float, float] = (-0.7, 0.7)
+    cmd_yaw: tuple[float, float] = (-0.7, 0.7)
+    forward_x: tuple[float, float] = (0.3, 1.0)
+    resample_s: tuple[float, float] = (3.0, 8.0)
+    standing: float = 0.1
+    heading: float = 0.3
+    forward: float = 0.2
+    heading_stiffness: float = 0.5
+    spawn_xy: float = 0.5
+    curriculum: bool = True
+    bounds_margin: float = 1.0
+
+
+class TerrainSim(TrackingSim):
+    def __init__(self, *args, setup: TerrainSetup | None = None, **kw):
+        self.setup = setup or TerrainSetup()
+        super().__init__(*args, **kw)
+
+    # ------------------------------------------------------------------ construction hooks
+    def _build_model(self, timestep: float, self_collision: bool):
+        st = self.setup
+        self.map = generate(st.terrain, st.seed)
+        self.hs = HeightSampler(self.map, self.device)
+        m = sim_model(timestep, terrain=self.map, collision="proxy", self_collision=self_collision, keep_floor=True)
+        m.opt.ccd_iterations = 50
+        m.opt.ccd_tolerance = 1e-4  # FP32 contact witnesses far from the origin
+        return m
+
+    def _data_sizes(self) -> dict:
+        return dict(nconmax=128, nccdmax=32, njmax=1000)
+
+    def _init_extra(self):
+        st, dev, N = self.setup, self.device, self.N
+        self.task = TerrainTask(self.mdp.kin, self.hs.ground, self.mdp, dev, st.reward)
+        self.cam = HeadCamera(st.camera, self.mdp.kin, self.hs.ground, dev)
+        self.vel_lo = N - self.n_vel
+        self.origins = torch.tensor(self.map.origins, device=dev)  # (rows=levels, cols, 3)
+        self.kinds_map = torch.tensor(self.map.tile_types, device=dev)
+        nr, nc = self.origins.shape[:2]
+        self.col = torch.arange(N, device=dev) % nc
+        self.level = torch.randint(0, min(st.max_init_level, nr - 1) + 1, (N,), device=dev)
+        self.kind = self.kinds_map[0, self.col]
+        self.info = torch.zeros(N, 2, device=dev)
+        self._update_info()
+        self.start_xy = torch.zeros(N, 2, device=dev)
+        self.heading_mode = torch.zeros(N, dtype=torch.bool, device=dev)
+        self.standing = torch.zeros(N, dtype=torch.bool, device=dev)
+        self.heading_target = torch.zeros(N, device=dev)
+        self.cmd_timer = torch.zeros(N, dtype=torch.long, device=dev)
+        self.cam_params = self.cam.sample_params(N, noise=not self.eval_mode)
+        self.depth_stack = torch.zeros(self.n_vel, st.camera.frames, *self.cam.shape, device=dev, dtype=torch.float16)
+        self.tick = torch.ones(N, dtype=torch.bool, device=dev)
+        lo = torch.tensor(self.map.offset, device=dev)
+        self.map_lo = lo + st.bounds_margin
+        self.map_hi = lo + torch.tensor(self.map.extent, device=dev) - st.bounds_margin
+        self.reset_count = 0
+
+    def _update_info(self):
+        stairs = (self.kind == STAIR_KINDS[0]) | (self.kind == STAIR_KINDS[1])
+        self.info[:, 0] = torch.where(stairs, STAIRS, 0.0)
+        self.info[:, 1] = self.level.float()
+
+    @property
+    def vel_max_step_reward(self) -> float:
+        return self.task.max_step_reward
+
+    # ------------------------------------------------------------------ resets
+    def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
+        if len(env_ids) == 0:
+            return
+        super().reset(env_ids, frames)
+        if not hasattr(self, "task"):
+            return
+        vel = env_ids[self.is_vel[env_ids]]
+        if len(vel):
+            self._place_on_tiles(vel)
+            self._camera_reset(vel)
+
+    def reset_standing(self, env_ids: torch.Tensor, frames: torch.Tensor):
+        super().reset_standing(env_ids, frames)
+        self._camera_reset(env_ids[self.is_vel[env_ids]])
+
+    def reset_on_tile(self, env_ids: torch.Tensor, col: torch.Tensor, level: torch.Tensor, yaw: torch.Tensor, frames: torch.Tensor):
+        """Default standing pose at the center of tile (level, col) with the given yaw (terrain evaluation)."""
+        self.col[env_ids], self.level[env_ids] = col, level
+        self.kind[env_ids] = self.kinds_map[0, col]
+        self._update_info()
+        super().reset_standing(env_ids, frames)
+        o = self.origins[level, col]
+        p = self.qpos[env_ids, :3].clone()
+        p[:, :2] = o[:, :2]
+        p[:, 2] = self.stand_height + self.hs.ground(o[:, :2])
+        R = axis_angle_to_mat(torch.tensor([0.0, 0.0, 1.0], device=self.device), yaw)
+        zero = torch.zeros(len(env_ids), 3, device=self.device)
+        self.write_state(env_ids, p, R, zero, zero, self.qpos[env_ids, 7:].clone(), torch.zeros(len(env_ids), 29, device=self.device))
+        self.start_xy[env_ids] = p[:, :2]
+        self._camera_reset(env_ids)
+
+    def _place_on_tiles(self, ids: torch.Tensor):
+        st, dev, n = self.setup, self.device, len(ids)
+        p, R, v, w, q, qd = (x[ids] for x in self.state())
+        yaw_now = torch.atan2(R[:, 1, 0], R[:, 0, 0])
+        stairs = self.info[ids, 0] > 0.5
+        yaw = torch.where(stairs, 0.0, torch.empty(n, device=dev).uniform_(-math.pi, math.pi))
+        Rz = axis_angle_to_mat(torch.tensor([0.0, 0.0, 1.0], device=dev), yaw - yaw_now)
+        o = self.origins[self.level[ids], self.col[ids]]
+        xy = o[:, :2] + torch.empty(n, 2, device=dev).uniform_(-st.spawn_xy, st.spawn_xy)
+        p = torch.cat((xy, (p[:, 2] + self.hs.ground(xy)).unsqueeze(-1)), -1)  # clip heights are above a flat floor
+        rot = lambda x: (Rz @ x.unsqueeze(-1)).squeeze(-1)  # noqa: E731
+        self.write_state(ids, p, Rz @ R, rot(v), rot(w), q, qd)
+        self.start_xy[ids] = xy
+
+    def _camera_reset(self, ids: torch.Tensor):
+        if not len(ids):
+            return
+        self.cam_params[ids] = self.cam.sample_params(len(ids), noise=not self.eval_mode)
+        frame = self._render(ids)
+        self.depth_stack[ids - self.vel_lo] = frame.half().unsqueeze(1).expand(-1, self.setup.camera.frames, -1, -1)
+        self.tick[ids] = True
+
+    def _render(self, ids: torch.Tensor) -> torch.Tensor:
+        S = tuple(x[ids] for x in self.state())
+        return self.cam.render(S, self.cam_params[ids], noise=not self.eval_mode)
+
+    # ------------------------------------------------------------------ commands
+    def resample_cmd(self, env_ids: torch.Tensor):
+        n = len(env_ids)
+        if n == 0 or not hasattr(self, "task"):
+            return super().resample_cmd(env_ids)
+        st, dev = self.setup, self.device
+        flat = self.kind[env_ids] == FLAT_KIND
+        super().resample_cmd(env_ids[flat])  # flat tiles: the flat-ground interface's commands (with reference commands)
+        self.heading_mode[env_ids[flat]] = False
+        self.standing[env_ids[flat]] = False
+        ids = env_ids[~flat]
+        m = len(ids)
+        if m:
+            u = lambda r: torch.empty(m, device=dev).uniform_(*r)  # noqa: E731
+            vel = torch.stack((u(st.cmd_x), u(st.cmd_y), u(st.cmd_yaw)), -1)
+            stairs = self.info[ids, 0] > 0.5
+            fwd = stairs | (torch.rand(m, device=dev) < st.forward)
+            vel = torch.where(fwd[:, None], torch.stack((u(st.forward_x), torch.zeros(m, device=dev), torch.zeros(m, device=dev)), -1), vel)
+            heading = fwd | (torch.rand(m, device=dev) < st.heading)
+            self.heading_mode[ids] = heading
+            self.heading_target[ids] = torch.where(fwd, 0.0, u((-math.pi, math.pi)))
+            self.standing[ids] = torch.rand(m, device=dev) < st.standing
+            vel = torch.where(self.standing[ids, None], 0.0, vel)
+            self.cmd_ref[ids] = False
+            if self.mdp.upper_cmd:
+                tmp = self.cmd[ids].clone()
+                super().resample_cmd(ids)  # draws a fresh upper-body target (and a velocity we overwrite)
+                self.cmd_ref[ids] = False
+                tmp[:, 3:] = self.cmd[ids, 3:]
+                self.cmd[ids] = tmp
+            self.cmd[ids, :3] = vel
+        self.cmd_timer[env_ids] = (torch.empty(n, device=dev).uniform_(*st.resample_s) / 0.02).long()
+        self._heading_control(env_ids)
+
+    def _cmd_due(self) -> torch.Tensor:
+        return (self.is_vel & (self.cmd_timer <= 0)).nonzero(as_tuple=False).squeeze(-1)
+
+    def _heading_control(self, ids: torch.Tensor | None = None):
+        st = self.setup
+        sel = self.heading_mode & self.is_vel & ~self.standing
+        if ids is not None:
+            mask = torch.zeros_like(sel)
+            mask[ids] = True
+            sel = sel & mask
+        R = self.state()[1]
+        err = self.heading_target - torch.atan2(R[:, 1, 0], R[:, 0, 0])
+        rate = (st.heading_stiffness * torch.atan2(err.sin(), err.cos())).clamp(*st.cmd_yaw)
+        self.cmd[:, 2] = torch.where(sel, rate, self.cmd[:, 2])
+
+    # ------------------------------------------------------------------ step hooks
+    def vel_reward(self, S1, cmd, a, a_prev):
+        return self.task.reward(S1, cmd, a, a_prev, self.info)
+
+    def vel_fall(self, S1):
+        return self.task.fall(S1)
+
+    def vel_timeout(self, f, clip_end, ep_step, S1):
+        xy = S1[0][:, :2]
+        out = ((xy < self.map_lo) | (xy > self.map_hi)).any(-1)
+        clip = self.cmd_ref & (f + 1 >= clip_end)  # reference commands end with their clip
+        return (ep_step + 1 >= (self.setup.episode_steps if not self.eval_mode else 10**9)) | out | clip
+
+    def _pre_step_out(self, out: dict):
+        out["info"] = self.info.clone()
+        out["cam"] = self.cam_params.clone()
+        out["tick"] = self.tick.clone()
+        out["depth"] = encode_u8(self.depth_stack[:, -1].float())
+
+    def _on_done(self, ids: torch.Tensor):
+        st = self.setup
+        vel = ids[self.is_vel[ids]]
+        if not st.curriculum or self.eval_mode or not len(vel):
+            return
+        dist = (self.qpos[vel, :2] - self.start_xy[vel]).norm(dim=-1)
+        up = dist > st.terrain.tile_size[0] / 2
+        down = (dist < self.cmd[vel, :2].norm(dim=-1) * st.episode_steps * 0.02 * 0.5) & ~up
+        lvl = self.level[vel] + up.long() - down.long()
+        nr = self.origins.shape[0]
+        lvl = torch.where(lvl >= nr, torch.randint(0, nr, lvl.shape, device=self.device), lvl.clamp(min=0))
+        self.level[vel] = lvl
+        self._update_info()
+
+    def _post_step(self, done: torch.Tensor, ids: torch.Tensor | None):
+        self.cmd_timer -= 1
+        self._heading_control()
+        self.cmd[:, :3] = torch.where((self.standing & self.is_vel)[:, None], 0.0, self.cmd[:, :3])
+        fresh = torch.zeros(self.N, dtype=torch.bool, device=self.device)
+        if ids is not None and len(ids):
+            fresh[ids] = True
+        tick = is_tick(self.ep_step, self.cam_params[:, 9]) & self.is_vel
+        self.tick = torch.where(fresh, True, tick)
+        todo = (tick & ~fresh).nonzero(as_tuple=False).squeeze(-1)
+        if len(todo):
+            frame = self._render(todo).half()
+            j = todo - self.vel_lo
+            self.depth_stack[j] = torch.cat((self.depth_stack[j, 1:], frame.unsqueeze(1)), 1)
+
+    # ------------------------------------------------------------------ stats
+    def level_stats(self) -> dict:
+        v = self.is_vel
+        out = {"level_mean": self.level[v].float().mean()}
+        for k in sorted(set(self.kind[v].tolist())):
+            sel = v & (self.kind == k)
+            out[f"level_{TILE_TYPES[k]}"] = self.level[sel].float().mean()
+        return out
+
+
+__all__ = ["TerrainSim", "TerrainSetup", "CAM_PARAM_DIM"]

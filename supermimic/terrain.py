@@ -24,6 +24,35 @@ class TerrainCfg:
     border_width: float = 5.0
     proportions: tuple[float, ...] = (0.10, 0.20, 0.15, 0.15, 0.15, 0.15, 0.10)
     platform_size: float = 1.2
+    # Optional mjlab-style stairs/slopes (None keeps the original shapes). Step height and slope grade
+    # (rise/run) are interpolated over the difficulty rows; platform/border are per kind.
+    stair_height: tuple[float, float] | None = None
+    stair_width: float = 0.30
+    stair_platform: float | None = None
+    stair_border: float = 0.25
+    slope_grade: tuple[float, float] | None = None
+    slope_platform: float | None = None
+    slope_border: float = 0.25
+    smooth_stairs: bool = True
+    # Placement: the map's (0, 0) tile corner sits at map_origin, and base_height lifts every height
+    # (keeps inverted tiles above a z = 0 floor plane that stays in the scene next to the map).
+    map_origin: tuple[float, float] = (0.0, 0.0)
+    base_height: float = 0.0
+
+
+def mjlab_rough_cfg(**overrides) -> TerrainCfg:
+    """Flat / pyramid stairs (up, down) / pyramid slopes (up, down) as in mjlab's ROUGH_TERRAINS_CFG
+    (Mjlab-Velocity-Rough-Terrain-Scan-Vel-Only-Unitree-G1) without its random-rough tiles:
+    proportions 0.2 / 0.5 / 0.5 / 0.1 / 0.1, steps 0-0.15 m x 0.30 m with a 3 m platform and 1 m border,
+    slopes 0-0.4 rise/run with a 2 m platform and 0.25 m border, 10 levels x 20 columns of 8 m tiles.
+    Stairs follow mjlab's box layout: first riser at the 1 m border, top platform (n + 1) steps high."""
+    kw = dict(proportions=(0.2, 0.0, 0.1, 0.1, 0.5, 0.5, 0.0), stair_height=(0.0, 0.15), stair_width=0.30,
+              stair_platform=3.0, stair_border=1.0, slope_grade=(0.0, 0.4), slope_platform=2.0, slope_border=0.25,
+              # mjlab builds stairs from boxes (vertical risers); a heightfield ramps a riser across one cell,
+              # so use 2 cm cells (risers ~82 deg) and no smoothing (the 3-sample filter made them ~45 deg)
+              horizontal_scale=0.02, smooth_stairs=False)
+    kw.update(overrides)
+    return TerrainCfg(**kw)
 
 
 @dataclass
@@ -68,10 +97,29 @@ def _tile(cfg: TerrainCfg, kind: int, difficulty: float, rng: np.random.Generato
         blend *= np.clip((cfg.platform_size / 2 + 0.2 - np.abs(y - sy / 2)) / 0.2, 0, 1)
         h += blend * (center - h)
     elif kind in (2, 3):
-        h = depth * np.tan(np.deg2rad(25 * difficulty)) * (1 if kind == 2 else -1)
+        if cfg.slope_grade is None:
+            h = depth * np.tan(np.deg2rad(25 * difficulty))
+        else:
+            plat = cfg.slope_platform if cfg.slope_platform is not None else cfg.platform_size
+            d = np.clip(edge - cfg.slope_border, 0, (min(sx, sy) - plat) / 2 - cfg.slope_border)
+            lo, hi = cfg.slope_grade
+            h = d * (lo + (hi - lo) * difficulty)
+        h = h * (1 if kind == 2 else -1)
     elif kind in (4, 5):
-        h = np.floor((depth + 1e-8) / 0.30) * (0.05 + 0.15 * difficulty) * (1 if kind == 4 else -1)
-        h = _smooth(h)
+        if cfg.stair_height is None:
+            h = np.floor((depth + 1e-8) / 0.30) * (0.05 + 0.15 * difficulty)
+        else:
+            # mjlab BoxPyramidStairs: border at 0, ring k (k = 0..n-1, d in [k w, (k+1) w) inside the border)
+            # at (k+1) h, the platform at (n+1) h, with n = int((size - 2 border - platform) / (2 w))
+            plat = cfg.stair_platform if cfg.stair_platform is not None else cfg.platform_size
+            n = int((min(sx, sy) - 2 * cfg.stair_border - plat) / (2 * cfg.stair_width) + 1e-9)
+            d = edge - cfg.stair_border
+            lo, hi = cfg.stair_height
+            k = np.minimum(np.floor(d / cfg.stair_width + 1e-6) + 1, n + 1)
+            h = np.where(d >= -1e-6, k, 0) * (lo + (hi - lo) * difficulty)
+        h = h * (1 if kind == 4 else -1)
+        if cfg.smooth_stairs:
+            h = _smooth(h)
     elif kind == 6:
         # Disjoint rectangular blocks; the center block also provides a standing platform.
         for bx in np.arange(1.0, sx - 0.5, 1.75):
@@ -126,11 +174,13 @@ def generate(cfg: TerrainCfg, seed: int = 0) -> Terrain:
             ix, iy = border + i * nx, border + j * ny
             heights[iy:iy + ny + 1, ix:ix + nx + 1] = tile
             z = tile[ny // 2:(ny + 1) // 2 + 1, nx // 2:(nx + 1) // 2 + 1].mean()
-            origins[i, j] = ((i + 0.5) * cfg.tile_size[0], (j + 0.5) * cfg.tile_size[1], z)
-    return Terrain(heights, origins, tile_types, r, (-cfg.border_width, -cfg.border_width))
+            origins[i, j] = ((i + 0.5) * cfg.tile_size[0] + cfg.map_origin[0], (j + 0.5) * cfg.tile_size[1] + cfg.map_origin[1],
+                             z + cfg.base_height)
+    heights += np.float32(cfg.base_height)
+    return Terrain(heights, origins, tile_types, r, (cfg.map_origin[0] - cfg.border_width, cfg.map_origin[1] - cfg.border_width))
 
 
-def add_hfield(xml: str, terrain: Terrain) -> str:
+def add_hfield(xml: str, terrain: Terrain, keep_floor: bool = False) -> str:
     """Replace floor with an allocated hfield; call write_hfield after compilation.
 
     Filling the compiled buffer avoids encoding millions of elevations into XML.
@@ -150,10 +200,11 @@ def add_hfield(xml: str, terrain: Terrain) -> str:
     world = root.find("worldbody")
     if world is None:
         world = ET.SubElement(root, "worldbody")
-    for geom in list(world.findall("geom")):
-        if geom.get("name") == "floor":
-            world.remove(geom)
-    ET.SubElement(world, "geom", name="floor", type="hfield", hfield="terrain", contype="0", conaffinity="1", condim="3",
+    if not keep_floor:  # keep_floor: the z = 0 plane stays (as "floor") next to the map ("terrain")
+        for geom in list(world.findall("geom")):
+            if geom.get("name") == "floor":
+                world.remove(geom)
+    ET.SubElement(world, "geom", name="terrain" if keep_floor else "floor", type="hfield", hfield="terrain", contype="0", conaffinity="1", condim="3",
                   pos=f"{terrain.offset[0] + sx / 2} {terrain.offset[1] + sy / 2} {lo}")
     return ET.tostring(root, encoding="unicode")
 
@@ -189,6 +240,15 @@ class HeightSampler:
         h = self.heights
         return ((1 - fy) * ((1 - fx) * h[iy, ix] + fx * h[iy, ix + 1])
                 + fy * ((1 - fx) * h[iy + 1, ix] + fx * h[iy + 1, ix + 1]))
+
+    def ground(self, xy: torch.Tensor) -> torch.Tensor:
+        """Height of the scene with a z = 0 floor plane around the map (sim_model(..., keep_floor=True)):
+        the map's bilinear height inside its bounds, 0 outside."""
+        lo = self.offset
+        hi = self.offset + self.resolution * torch.tensor([self.heights.shape[1] - 1, self.heights.shape[0] - 1],
+                                                          device=xy.device, dtype=xy.dtype)
+        inside = ((xy >= lo) & (xy <= hi)).all(-1)
+        return torch.where(inside, self.sample(xy), torch.zeros((), device=xy.device))
 
     def scan(self, p: torch.Tensor, R: torch.Tensor, grid: torch.Tensor | None = None) -> torch.Tensor:
         """Root-relative p_z - h on an (n, 2) heading-frame grid, returning (B, n)."""

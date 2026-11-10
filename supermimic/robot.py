@@ -119,7 +119,8 @@ def default_joint_pos_list() -> list[float]:
 
 
 def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
-              collision: Literal["mesh", "proxy"] = "mesh", self_collision: bool = False) -> mujoco.MjModel:
+              collision: Literal["mesh", "proxy"] = "mesh", self_collision: bool = False,
+              keep_floor: bool = False) -> mujoco.MjModel:
     """Free pelvis, position actuators, armature, plane or terrain.
 
     Without ``self_collision`` robot geoms touch only the floor. With it, every pair of robot collision
@@ -142,7 +143,7 @@ def sim_model(timestep: float = 0.005, terrain: Terrain | None = None,
     if terrain is not None:
         from .terrain import add_hfield, write_hfield
 
-        xml = add_hfield(xml, terrain)
+        xml = add_hfield(xml, terrain, keep_floor=keep_floor)
     m = _compile(xml)
     if collision == "proxy":
         m = _compile(_proxy_xml(xml, m))

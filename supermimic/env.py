@@ -64,12 +64,12 @@ class TrackingSim:
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
-        self.mjm = mjm = sim_model(CONTROL_DT / substeps, self_collision=self_collision)
+        self.mjm = mjm = self._build_model(CONTROL_DT / substeps, self_collision)
         assert [mjm.joint(i).name for i in range(1, mjm.njnt)] == G1_JOINT_NAMES
         self.wp_device = wp.get_device(dev)
         with wp.ScopedDevice(self.wp_device):
             self.model = mjw.put_model(mjm)
-            self.data = mjw.make_data(mjm, nworld=num_envs, nconmax=128, njmax=600)
+            self.data = mjw.make_data(mjm, nworld=num_envs, **self._data_sizes())
             friction = _expand(self.model, "geom_friction", num_envs)
             ipos = _expand(self.model, "body_ipos", num_envs)
             self._blown = wp.zeros(num_envs, dtype=bool)
@@ -116,7 +116,43 @@ class TrackingSim:
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.stand_height = self._stand_height()
+        self._init_extra()
         self.reset(torch.arange(self.N, device=dev))
+
+    # ------------------------------------------------------------------ hooks (terrain_env.TerrainSim overrides them)
+    def _build_model(self, timestep: float, self_collision: bool):
+        return sim_model(timestep, self_collision=self_collision)
+
+    def _data_sizes(self) -> dict:
+        return dict(nconmax=128, njmax=600)
+
+    def _init_extra(self):
+        pass
+
+    @property
+    def vel_max_step_reward(self) -> float:
+        return self.mdp.max_step_reward_vel
+
+    def _cmd_due(self) -> torch.Tensor:
+        return (self.is_vel & (self.ep_step % CMD_RESAMPLE_STEPS == 0)).nonzero(as_tuple=False).squeeze(-1)
+
+    def vel_reward(self, S1, cmd, a, a_prev):
+        return self.mdp.vel_reward(S1, cmd, a, a_prev)
+
+    def vel_fall(self, S1):
+        return self.mdp.fall(S1)
+
+    def vel_timeout(self, f, clip_end, ep_step, S1):
+        return (f + 1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
+
+    def _pre_step_out(self, out: dict):
+        """Add per-transition extras describing the pre-step state to the transition dict."""
+
+    def _post_step(self, done: torch.Tensor, ids: torch.Tensor | None):
+        """After bookkeeping (and, in training, after the resets of `ids`)."""
+
+    def _on_done(self, ids: torch.Tensor):
+        """Episodes `ids` end (before their reset)."""
 
     def _stand_height(self) -> float:
         """Pelvis height at which the default pose touches the floor."""
@@ -252,10 +288,11 @@ class TrackingSim:
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         f1 = torch.minimum(f + 1, clip_end)
         vel = self.is_vel
-        r = torch.where(vel, self.mdp.vel_reward(S1, cmd, a, a_prev), self.mdp.reward(S1, f1, a, a_prev))
+        r = torch.where(vel, self.vel_reward(S1, cmd, a, a_prev), self.mdp.reward(S1, f1, a, a_prev))
         r = torch.where(bad, 0.0, r)
-        term = torch.where(vel, self.mdp.fall(S1), self.mdp.termination(S1, f1)) | bad
-        timeout = (f + 1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
+        term = torch.where(vel, self.vel_fall(S1), self.mdp.termination(S1, f1)) | bad
+        timeout = torch.where(vel, self.vel_timeout(f, clip_end, ep_step, S1),
+                              (f + 1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps))  # fmt: skip
         if self.eval_mode:
             timeout = timeout & ~vel  # the step test ends on its own clock
         done = term | timeout
@@ -264,6 +301,7 @@ class TrackingSim:
             "term": term, "done": done, "ep_step": ep_step, "xi": xi, "cmd": cmd, "cmd_ref": cmd_ref, "valid": ~bad,
             "n_blown": bad.sum(),
         }  # fmt: skip
+        self._pre_step_out(out)
         # bookkeeping
         self.ep_disc_ret += (self.gamma ** ep_step.float()) * r
         self.ep_ret += r
@@ -272,14 +310,15 @@ class TrackingSim:
         self.a_prev = a.clone()
         if self.resample_cmd_enabled:
             self.cmd[cmd_ref] = self.mdp.ref_full_cmd(f1[cmd_ref])
-            due = (vel & (self.ep_step % CMD_RESAMPLE_STEPS == 0)).nonzero(as_tuple=False).squeeze(-1)
-            self.resample_cmd(due)
+            self.resample_cmd(self._cmd_due())
         if self.eval_mode:
             self.failed_eval |= term & ~self.done_eval
             self.done_eval |= done
+            self._post_step(done, None)
             return out
         ids = done.nonzero(as_tuple=False).squeeze(-1)
         if len(ids) > 0:
+            self._on_done(ids)
             T = self.ep_step[ids].float()
             mo = ids[~vel[ids] & ~bad[ids]]
             if len(mo) > 0:
@@ -291,10 +330,11 @@ class TrackingSim:
             out["done_ids"] = ids
             out["done_vel"] = vel[ids]
             out["ep_len"] = T
-            out["ep_ret_norm"] = self.ep_ret[ids] / (T * torch.where(vel[ids], self.mdp.max_step_reward_vel, MAX_STEP_REWARD))
+            out["ep_ret_norm"] = self.ep_ret[ids] / (T * torch.where(vel[ids], self.vel_max_step_reward, MAX_STEP_REWARD))
             if bool(bad.any()):  # clear the solver state (warm start, contacts) of blown-up worlds
                 self.blown.copy_(bad)
                 with wp.ScopedDevice(self.wp_device):
                     mjw.reset_data(self.model, self.data, reset=self._blown)
             self.reset(ids)
+        self._post_step(done, ids)
         return out

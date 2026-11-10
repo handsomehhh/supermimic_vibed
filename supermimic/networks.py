@@ -66,19 +66,27 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 class WorldModel(nn.Module):
-    """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments."""
+    """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments.
 
-    def __init__(self, hidden=(2048, 2048, 2048)):
+    terrain_dim > 0: the input also carries privileged terrain features (height scan around the pelvis,
+    sole-pad clearances; terrain_mdp.terrain_features), and the height feature is taken above the ground."""
+
+    def __init__(self, hidden=(2048, 2048, 2048), terrain_dim: int = 0):
         super().__init__()
-        self.in_dim = INV_DIM + NUM_J + XI_DIM
+        self.terrain_dim = terrain_dim
+        self.in_dim = INV_DIM + NUM_J + XI_DIM + terrain_dim
         self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(WM_OUT, eps=1e-4)
 
-    def inputs(self, S, a, xi_n):
-        return torch.cat((invariant_features(S), a, xi_n), -1)
+    def inputs(self, S, a, xi_n, terr=None):
+        """terr: (ground height under the pelvis (B,), terrain features (B, terrain_dim)) when terrain_dim > 0."""
+        if not self.terrain_dim:
+            return torch.cat((invariant_features(S), a, xi_n), -1)
+        gz, feat = terr
+        return torch.cat((invariant_features(S, gz), a, xi_n, feat), -1)
 
     @staticmethod
     def targets(S, S1):
@@ -101,9 +109,9 @@ class WorldModel(nn.Module):
             -1,
         )
 
-    def step(self, S, a, xi_n):
+    def step(self, S, a, xi_n, terr=None):
         p, R, v, w, q, qd = S
-        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n)))
+        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n, terr)))
         d = y * self.out_norm.std() + self.out_norm.mean
         H = yaw_mat(R)
         dp, dth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)
@@ -135,6 +143,23 @@ class WorldModel(nn.Module):
         )
 
 
+class DepthCNN(nn.Module):
+    """Per-frame encoder of a normalized 36 x 64 depth image (values in [-1, 1]) to `out` features."""
+
+    def __init__(self, out: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 16, 5, stride=2, padding=2), nn.ELU(),  # 18 x 32
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ELU(),  # 9 x 16
+            nn.Conv2d(32, 32, 3, stride=2, padding=1), nn.ELU(),  # 5 x 8
+            nn.Flatten(), nn.Linear(32 * 5 * 8, out), nn.ELU())  # fmt: skip
+
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        lead = img.shape[:-2]
+        y = run_mlp(self.net, img.reshape(-1, 1, *img.shape[-2:]))
+        return y.reshape(*lead, -1)
+
+
 class Policy(nn.Module):
     """Per-interface goal encoders and a shared decoder (paper Eq. A.1): a = dec(enc_i(g), o_{t-9:t}).
 
@@ -143,11 +168,18 @@ class Policy(nn.Module):
     z in R^32 is bounded by tanh; the policy is deterministic.
     """
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, cmd_dim: int = 3):
+    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, cmd_dim: int = 3,
+                 depth_frames: int = 0, depth_feat: int = 64, depth_latent: int = 64):
         super().__init__()
         self.hist = hist
+        self.depth_frames = depth_frames
         self.enc = mlp(goal_dim, [2048, 1024, 512, 256], z_dim)
-        self.enc_vel = mlp(cmd_dim + obs_dim * hist, [256, 256], z_dim)
+        # velocity encoder input: [command, observation history, depth latent]; the depth latent comes last so
+        # a flat-ground checkpoint's first layer is a prefix of this one (warm start with zero new columns)
+        self.enc_vel = mlp(cmd_dim + obs_dim * hist + (depth_latent if depth_frames else 0), [256, 256], z_dim)
+        if depth_frames:
+            self.depth_cnn = DepthCNN(depth_feat)
+            self.depth_mlp = mlp(depth_frames * depth_feat, [256], depth_latent)
         self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], NUM_J)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
@@ -158,9 +190,17 @@ class Policy(nn.Module):
     def z_motion(self, goal: torch.Tensor) -> torch.Tensor:
         return torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
 
-    def z_vel(self, obs_hist: torch.Tensor, cmd_n: torch.Tensor) -> torch.Tensor:
+    def depth_features(self, img: torch.Tensor) -> torch.Tensor:
+        """(..., 36, 64) frames -> (..., depth_feat); frames are encoded once and stacked by the caller."""
+        return self.depth_cnn(img)
+
+    def z_vel(self, obs_hist: torch.Tensor, cmd_n: torch.Tensor, dfeat: torch.Tensor | None = None) -> torch.Tensor:
+        """dfeat: (B, depth_frames, depth_feat) per-frame features of the last frames, oldest first."""
         o = self.obs_norm(obs_hist).flatten(-2)
-        return torch.tanh(run_mlp(self.enc_vel, torch.cat((cmd_n, o), -1)))
+        x = torch.cat((cmd_n, o), -1)
+        if self.depth_frames:
+            x = torch.cat((x, run_mlp(self.depth_mlp, dfeat.flatten(-2))), -1)
+        return torch.tanh(run_mlp(self.enc_vel, x))
 
     def decode(self, z: torch.Tensor, obs_hist: torch.Tensor, frozen: bool = False) -> torch.Tensor:
         """frozen: stop-gradient on the decoder weights (gradients still reach z)."""
@@ -174,8 +214,10 @@ class Policy(nn.Module):
         """Motion-tracking policy. obs_hist: (B, hist, obs_dim) noisy observations, newest last."""
         return self.decode(self.z_motion(goal), obs_hist)
 
-    def act_vel(self, obs_hist: torch.Tensor, cmd_n: torch.Tensor) -> torch.Tensor:
-        return self.decode(self.z_vel(obs_hist, cmd_n), obs_hist)
+    def act_vel(self, obs_hist: torch.Tensor, cmd_n: torch.Tensor, depth: torch.Tensor | None = None) -> torch.Tensor:
+        """depth: (B, depth_frames, 36, 64) frame stack (oldest first) for depth policies."""
+        dfeat = self.depth_features(depth) if self.depth_frames else None
+        return self.decode(self.z_vel(obs_hist, cmd_n, dfeat), obs_hist)
 
 
 class Critic(nn.Module):
