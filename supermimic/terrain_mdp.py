@@ -114,11 +114,13 @@ class TerrainTask:
                                 + (cfg.w_upper if mdp.upper_cmd else 0.0)) * CONTROL_DT  # fmt: skip
         self.cos_fall = math.cos(math.radians(cfg.fall_tilt_deg))
         if torch.device(device).type == "cuda":
-            # FK of all bodies + ground lookups are ~5x faster fused; dynamic: batch sizes vary between call sites
-            self.features = torch.compile(self.features, dynamic=True)
-            self.reward = torch.compile(self.reward, dynamic=True)
-            self.critic_features = torch.compile(self.critic_features, dynamic=True)
-            self.soft_fall = torch.compile(self.soft_fall, dynamic=True)
+            # FK of all bodies + ground lookups are ~5x faster fused; static shapes (each call site uses a fixed
+            # batch size; dynamic-shape kernels were several times slower), one compiled graph per call site
+            torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+            self.features = torch.compile(self.features, dynamic=False)
+            self.reward = torch.compile(self.reward, dynamic=False)
+            self.critic_features = torch.compile(self.critic_features, dynamic=False)
+            self.soft_fall = torch.compile(self.soft_fall, dynamic=False)
 
     def _mass_model(self):
         """Per kin-body mass, CoM offset and inertia (fixed children such as head_link folded into their parent)."""

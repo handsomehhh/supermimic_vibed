@@ -493,7 +493,12 @@ def collect(n_steps: int, stats: dict):
         buffer.add(out)
         ok = out["valid"]
         S0, S1 = unflatten_state(out["s"][ok]), unflatten_state(out["s1"][ok])
-        wm.in_norm.update(wm.inputs(S0, out["a"][ok], normalize_xi(out["xi"][ok]), _terr(S0)))
+        if TERRAIN:  # terrain features at a fixed batch size (all worlds), then the valid rows
+            Sa = unflatten_state(out["s"])
+            gz, feat = _terr(Sa)
+            wm.in_norm.update(wm.inputs(S0, out["a"][ok], normalize_xi(out["xi"][ok]), (gz[ok], feat[ok])))
+        else:
+            wm.in_norm.update(wm.inputs(S0, out["a"][ok], normalize_xi(out["xi"][ok])))
         wm.out_norm.update(wm.targets(S0, S1))
         stats["blown"].append(out["n_blown"])
         sim_steps += args.num_envs * WORLD
