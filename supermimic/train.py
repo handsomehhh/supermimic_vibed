@@ -585,6 +585,20 @@ def save_ckpt(it: int):
     os.replace(path + ".tmp", path)
 
 
+TIMING = int(os.environ.get("SM_TIMING", "0"))  # print the mean wall time per phase every log row
+t_phase, t_last = {}, [0.0]
+
+
+def tmark(name: str):
+    if not TIMING:
+        return
+    torch.cuda.synchronize()
+    now = time.time()
+    if name != "start":
+        t_phase[name] = t_phase.get(name, 0.0) + now - t_last[0]
+    t_last[0] = now
+
+
 for it in range(start_it, args.iterations):
     lr = lr_at(it)
     for o in OPTS.values():
@@ -593,14 +607,18 @@ for it in range(start_it, args.iterations):
     step_acc += 1.0 / args.utd
     n = int(step_acc)
     step_acc -= n
+    tmark("start")
     collect(n, stats)
+    tmark("collect")
     sync_norms(pi.obs_norm, pi.goal_norm, wm.in_norm, wm.out_norm)
     for _ in range(args.wm_batches):
         l, e8 = wm_update()
+    tmark("world_model")
     agg.setdefault("wm", []).append(l), agg.setdefault("wm8", []).append(e8)
     if it >= args.wm_only_iters:
         for k, v in policy_update().items():
             agg.setdefault(k, []).append(v)
+        tmark("policy")
     if (it + 1) % args.log_every == 0:
         stop = torch.tensor(float(MAIN and os.path.exists(stop_file)), device=dev)
         if WORLD > 1:
@@ -633,6 +651,9 @@ for it in range(start_it, args.iterations):
                   f"vel: imag_r {r['imag_rew_v']:.3f} sim_r {r['sim_rew_v']:.3f} cmd_err {r['cmd_err']:.3f} fall {r['fall_frac_v']:.2f} "
                   f"align {r['align']:.4f}" + (f" upper_err {r['upper_err']:.3f}" if args.upper_cmd else "")
                   + (f" level {r['terrain_level']:.2f}" if TERRAIN else "") + f" | blowups {int(r['sim_blowups'])} | {ips:.2f} it/s", flush=True)  # fmt: skip
+        if TIMING and MAIN:
+            print("[timing] " + ", ".join(f"{k} {v / args.log_every:.3f}s" for k, v in t_phase.items()), flush=True)
+            t_phase.clear()
         stats = {k: [] for k in STAT_KEYS}
         agg = {}
         if bool(stop):
