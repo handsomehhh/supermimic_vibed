@@ -19,7 +19,7 @@ Depth: head_camera.HeadCamera at 30 Hz, a 10-frame stack per velocity world.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 
 import torch
@@ -36,7 +36,11 @@ FLAT_KIND, STAIR_KINDS = TILE_TYPES.index("flat"), (TILE_TYPES.index("stairs_up"
 
 @dataclass
 class TerrainSetup:
-    terrain: TerrainCfg = field(default_factory=lambda: mjlab_rough_cfg(map_origin=(60.0, -85.0), base_height=1.5))
+    # physics map at 5 cm cells (finer cells overflow MuJoCo-Warp's 50-contact cap per geom-heightfield pair and
+    # triple the blow-ups); the camera renders the same terrain from a 2 cm copy (camera_scale) so risers look
+    # near-vertical (~82 deg) instead of the physics map's 5 cm ramp (~72 deg); step tops coincide
+    terrain: TerrainCfg = field(default_factory=lambda: mjlab_rough_cfg(map_origin=(60.0, -85.0), base_height=1.5, horizontal_scale=0.05))
+    camera_scale: float | None = 0.02
     seed: int = 0
     camera: HeadCameraCfg = field(default_factory=HeadCameraCfg)
     reward: TerrainRewardCfg = field(default_factory=TerrainRewardCfg)
@@ -66,6 +70,9 @@ class TerrainSim(TrackingSim):
         st = self.setup
         self.map = generate(st.terrain, st.seed)
         self.hs = HeightSampler(self.map, self.device)
+        self.hs_cam = self.hs
+        if st.camera_scale and st.camera_scale != st.terrain.horizontal_scale:
+            self.hs_cam = HeightSampler(generate(replace(st.terrain, horizontal_scale=st.camera_scale), st.seed), self.device)
         m = sim_model(timestep, terrain=self.map, collision="hybrid", self_collision=self_collision, keep_floor=True)
         m.opt.ccd_iterations = 50
         m.opt.ccd_tolerance = 1e-4  # FP32 contact witnesses far from the origin
@@ -77,7 +84,7 @@ class TerrainSim(TrackingSim):
     def _init_extra(self):
         st, dev, N = self.setup, self.device, self.N
         self.task = TerrainTask(self.mdp.kin, self.hs.ground, self.mdp, dev, st.reward)
-        self.cam = HeadCamera(st.camera, self.mdp.kin, self.hs.ground, dev)
+        self.cam = HeadCamera(st.camera, self.mdp.kin, self.hs_cam.ground, dev)
         self.vel_lo = N - self.n_vel
         self.origins = torch.tensor(self.map.origins, device=dev)  # (rows=levels, cols, 3)
         self.kinds_map = torch.tensor(self.map.tile_types, device=dev)
