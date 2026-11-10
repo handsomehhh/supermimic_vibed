@@ -25,7 +25,7 @@ import math
 import torch
 
 from .env import TrackingSim
-from .head_camera import CAM_PARAM_DIM, HeadCamera, encode_u8, is_tick
+from .head_camera import CAM_PARAM_DIM, HeadCamera, arrives, encode_u8, max_latency, ring_len
 from .robot import sim_model
 from .rotations import axis_angle_to_mat
 from .terrain import TILE_TYPES, HeightSampler, generate
@@ -75,7 +75,10 @@ class TerrainSim(TrackingSim):
         self.heading_target = torch.zeros(N, device=dev)
         self.cmd_timer = torch.zeros(N, dtype=torch.long, device=dev)
         self.cam_params = self.cam.sample_params(N, noise=not self.eval_mode)
-        self.depth_stack = torch.zeros(self.n_vel, st.camera.frames, *self.cam.shape, device=dev, dtype=torch.float16)
+        # arrived frames, oldest first (the policy sees every `stride`-th one, see depth_stack), and the frames
+        # rendered at the last max_latency + 1 control steps (newest last), from which delayed frames arrive
+        self.depth_ring = torch.zeros(self.n_vel, ring_len(st.camera), *self.cam.shape, device=dev, dtype=torch.float16)
+        self.render_hist = torch.zeros(self.n_vel, max_latency(st.camera) + 1, *self.cam.shape, device=dev, dtype=torch.float16)
         self.tick = torch.ones(N, dtype=torch.bool, device=dev)
         self.fresh = torch.zeros(N, dtype=torch.bool, device=dev)  # velocity worlds reset since their last frame
         self._in_step = False
@@ -149,18 +152,28 @@ class TerrainSim(TrackingSim):
         if not self._in_step:  # resets outside step() (construction, evaluation) get their frame right away
             self._update_frames(torch.zeros(self.N, dtype=torch.bool, device=self.device))
 
+    @property
+    def depth_stack(self) -> torch.Tensor:
+        """(n_vel, frames, H, W) policy depth input, oldest first."""
+        return self.depth_ring[:, :: self.setup.camera.stride]
+
     def _update_frames(self, tick: torch.Tensor):
         """One fixed-size render of all velocity worlds (a fixed shape keeps the compiled renderer fast); worlds
-        reset since their last frame fill their stack with it, worlds at a tick push it."""
+        reset since their last frame fill their ring (and render history) with it; worlds where a frame arrives
+        (``tick``) push the frame rendered `latency` steps ago."""
         if not self.n_vel:
             return
         v = slice(self.vel_lo, self.N)
         S = tuple(x[v] for x in self.state())
         frame = self.cam.render(S, self.cam_params[v], noise=not self.eval_mode).half()
         fresh, tick = self.fresh[v], tick[v] & ~self.fresh[v]
-        rolled = torch.cat((self.depth_stack[:, 1:], frame.unsqueeze(1)), 1)
-        filled = frame.unsqueeze(1).expand_as(self.depth_stack)
-        self.depth_stack = torch.where(fresh[:, None, None, None], filled, torch.where(tick[:, None, None, None], rolled, self.depth_stack))
+        hist = torch.cat((self.render_hist[:, 1:], frame.unsqueeze(1)), 1)
+        self.render_hist = torch.where(fresh[:, None, None, None], frame.unsqueeze(1).expand_as(hist), hist)
+        lat = self.cam_params[v, 10].long().clamp(0, self.render_hist.shape[1] - 1)
+        arrived = self.render_hist[torch.arange(self.n_vel, device=self.device), -1 - lat]
+        rolled = torch.cat((self.depth_ring[:, 1:], arrived.unsqueeze(1)), 1)
+        filled = frame.unsqueeze(1).expand_as(self.depth_ring)
+        self.depth_ring = torch.where(fresh[:, None, None, None], filled, torch.where(tick[:, None, None, None], rolled, self.depth_ring))
         self.fresh[v] = False
 
     # ------------------------------------------------------------------ commands
@@ -229,7 +242,7 @@ class TerrainSim(TrackingSim):
         out["info"] = self.info.clone()
         out["cam"] = self.cam_params.clone()
         out["tick"] = self.tick.clone()
-        out["depth"] = encode_u8(self.depth_stack[:, -1].float())
+        out["depth"] = encode_u8(self.depth_ring[:, -1].float())
 
     def _on_done(self, ids: torch.Tensor):
         st = self.setup
@@ -256,11 +269,28 @@ class TerrainSim(TrackingSim):
         self.cmd_timer -= 1
         self._heading_control()
         self.cmd[:, :3] = torch.where((self.standing & self.is_vel)[:, None], 0.0, self.cmd[:, :3])
-        tick = is_tick(self.ep_step, self.cam_params[:, 9]) & self.is_vel
+        tick = arrives(self.ep_step, self.cam_params) & self.is_vel
+        if self.setup.camera.frame_drop > 0 and not self.eval_mode:
+            tick = tick & (torch.rand(self.N, device=self.device) >= self.setup.camera.frame_drop)
         self.tick = tick | self.fresh
         self._update_frames(tick)
 
     # ------------------------------------------------------------------ stats
+    def body_forces(self) -> torch.Tensor:
+        """(N, nbody, 3) world-frame contact force on each body from all its contacts at the last substep
+        (stairs.body_contact_vectors decodes the pyramidal forces; it scales by 1/4 for a substep average)."""
+        import warp as wp
+
+        from .stairs import body_contact_vectors
+
+        c = self.data.contact
+        with wp.ScopedDevice(self.wp_device):
+            out = wp.zeros((self.N, self.mjm.nbody, 3), dtype=float)
+            wp.launch(body_contact_vectors, dim=self.data.naconmax,
+                      inputs=[self.data.nacon, c.worldid, c.geom, c.efc_address, self.data.efc.force,
+                              self.model.geom_bodyid, c.frame, c.friction, out])  # fmt: skip
+        return wp.to_torch(out) * 4
+
     def level_stats(self) -> dict:
         v = self.is_vel
         out = {"level_mean": self.level[v].float().mean()}

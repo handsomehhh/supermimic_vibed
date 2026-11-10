@@ -63,6 +63,8 @@ parser.add_argument("--upper_cmd", action="store_true",
 parser.add_argument("--terrain", action="store_true",
                     help="velocity interface on mjlab-style terrain with the head depth camera (terrain_env.TerrainSim)")
 parser.add_argument("--terrain_seed", type=int, default=0)
+parser.add_argument("--terrain_variant", type=str, default="v1", help="terrain_setup.TERRAIN_VARIANTS (rewards, depth realism, visual memory)")
+parser.add_argument("--dec_lr_mult", type=float, default=1.0, help="learning-rate factor of the shared decoder (protects motion tracking)")
 parser.add_argument("--init_from", type=str, default=None,
                     help="start from this checkpoint's world model, motion encoder, decoder and motion critic; modules whose "
                          "shapes changed (velocity encoder/critic under --upper_cmd) and the policy optimizer start fresh")
@@ -118,18 +120,26 @@ if MAIN:
 
 TERRAIN = args.terrain and VEL
 if TERRAIN:
-    from supermimic.head_camera import CAM_PARAM_DIM, decode_u8, is_tick
-    from supermimic.terrain_env import TerrainSetup, TerrainSim
+    from supermimic.head_camera import CAM_PARAM_DIM, arrives, decode_u8, max_latency, ring_len
+    from supermimic.terrain_env import TerrainSim
     from supermimic.terrain_mdp import TERRAIN_FEAT_DIM, terrain_critic_dim
+    from supermimic.terrain_setup import make_setup
 
-    SETUP = TerrainSetup(seed=args.terrain_seed)
-    NFR = SETUP.camera.frames
+    SETUP = make_setup(args.terrain_variant, args.terrain_seed)
+    NFR = SETUP.camera.frames  # frames the policy sees
+    DS = SETUP.camera.stride
+    NRING = ring_len(SETUP.camera)  # arrived frames kept (every DS-th one is a policy input)
+    LMAX = max_latency(SETUP.camera)
+    # replay window (control steps) holding NRING ticks at 30 Hz against 50 Hz control, with slack for dropped frames
+    DEPTH_WINDOW = int(math.ceil(NRING * 5 / 3 * (1 + 2 * SETUP.camera.frame_drop))) + 3
 wm = WorldModel(terrain_dim=TERRAIN_FEAT_DIM if TERRAIN else 0).to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh, cmd_dim=mdp.cmd_dim, depth_frames=NFR if TERRAIN else 0).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
 critic_v = Critic(terrain_critic_dim(args.upper_cmd) if TERRAIN else vel_critic_dim(args.upper_cmd)).to(dev)
 opt_wm = torch.optim.Adam(wm.parameters(), lr=LR)
-opt_pi = torch.optim.Adam(pi.parameters(), lr=LR, betas=(0.9, 0.95))
+_dec = set(id(p) for p in pi.dec.parameters())
+opt_pi = torch.optim.Adam([{"params": [p for p in pi.parameters() if id(p) not in _dec], "lr_scale": 1.0},
+                           {"params": list(pi.dec.parameters()), "lr_scale": args.dec_lr_mult}], lr=LR, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=LR)
 opt_vv = torch.optim.Adam(critic_v.parameters(), lr=LR)
 MODELS = {"wm": wm, "pi": pi, "critic": critic, "critic_v": critic_v}
@@ -308,7 +318,7 @@ def sample_valid_starts(B: int, env_lo: int, env_hi: int):
     starts, hists, n = [], [], 0
     terrain_vel = TERRAIN and env_lo >= N_MO
     while n < B:
-        s, h = buffer.sample_starts(2 * B, Hh, env_lo, env_hi, depth_window=20 if terrain_vel else 0)
+        s, h = buffer.sample_starts(2 * B, Hh, env_lo, env_hi, depth_window=DEPTH_WINDOW if terrain_vel else 0)
         f = s["f"]
         in_clip = f + HZ <= motion.clip_end[motion.clip_id[f]]
         # terrain velocity worlds run past their spawn clip; only reference commands need the clip ahead
@@ -370,7 +380,15 @@ def policy_update():
         sv_c = cat(sv)
         info_v, cam_v = sv_c["info"], sv_c["cam"]
         k_v = sv_c["ep_step"].long()  # control step since reset of the start state
-        dfeat = pi.depth_features(decode_u8(sv_c["depth"]))  # (BV, frames, feat), with gradient into the CNN
+        dfeat = pi.depth_features(decode_u8(sv_c["depth"]))  # (BV, NRING, feat) arrived frames, gradient into the CNN
+        if LMAX:
+            # frames taken at the start state and the LMAX steps before it are still in flight: render them from
+            # the logged states (the history is clamped at the episode start, as the simulator's render history)
+            hs_v = unflatten_state(cat(hv)["s"][:, -(LMAX + 1):].flatten(0, 1))
+            rhist = torch.stack([cam.render(tuple(x.view(BV, LMAX + 1, *x.shape[1:])[:, j] for x in hs_v), cam_v, noise=True)
+                                 for j in range(LMAX + 1)], 1).half()  # fmt: skip
+            lat_v = cam_v[:, 10].long().clamp(0, LMAX)
+            rows_v = torch.arange(BV, device=dev)
     xi, f, cmd, cmd_ref = s["xi"], s["f"], s["cmd"], s["cmd_ref"]
     a_prev = s["a_prev"]
     xi_n = normalize_xi(xi)
@@ -385,7 +403,7 @@ def policy_update():
     n_render = 0
     for t in range(HZ):
         Aps.append(a_prev), Cs.append(cmd)
-        S, a_prev, o_hist, f, cmd, al = imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref, dfeat)
+        S, a_prev, o_hist, f, cmd, al = imag_step(S, o_hist, f, xi, xi_n, cmd, cmd_ref, dfeat[:, ::DS] if TERRAIN else None)
         Ss.append(S), As.append(a_prev), Fs.append(f)
         align = align + al / HZ
         if TERRAIN and t + 1 < HZ:
@@ -393,7 +411,13 @@ def policy_update():
             # image), encode it (gradient into the CNN) and push it onto the frame stack
             # (all velocity rows are rendered at a fixed batch size, which keeps the compiled renderer fast)
             frames = cam.render(tuple(x[BM:].detach() for x in S), cam_v, noise=True)
-            tick = is_tick(k_v + t + 1, cam_v[:, 9]).nonzero(as_tuple=False).squeeze(-1)
+            if LMAX:
+                rhist = torch.cat((rhist[:, 1:], frames.half().unsqueeze(1)), 1)
+                frames = rhist[rows_v, -1 - lat_v].float()
+            arr = arrives(k_v + t + 1, cam_v)
+            if SETUP.camera.frame_drop > 0:
+                arr = arr & (torch.rand_like(k_v, dtype=torch.float32) >= SETUP.camera.frame_drop)
+            tick = arr.nonzero(as_tuple=False).squeeze(-1)
             feat = pi.depth_features(frames[tick])
             rolled = torch.cat((dfeat[tick, 1:], feat.unsqueeze(1)), 1)
             dfeat = dfeat.index_copy(0, tick, rolled)
@@ -464,7 +488,7 @@ if TERRAIN:
     task, cam = env.task, env.cam
     MAX_STEP_REWARD_VEL = task.max_step_reward
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, cmd_dim=mdp.cmd_dim, terrain_vel=N_VEL, cam_dim=CAM_PARAM_DIM,
-                          frames=NFR, image=cam.shape)  # fmt: skip
+                          frames=NRING, image=cam.shape)  # fmt: skip
     if MAIN:
         print(f"[terrain] map {env.map.heights.shape} cells at {env.map.resolution} m, {env.origins.shape[0]} levels x "
               f"{env.origins.shape[1]} columns; velocity worlds {N_VEL}/{args.num_envs} per GPU", flush=True)  # fmt: skip
@@ -611,7 +635,7 @@ for it in range(start_it, args.iterations):
     lr = lr_at(it)
     for o in OPTS.values():
         for gparam in o.param_groups:
-            gparam["lr"] = lr * (rb["lr_mult"] if o is opt_pi else 1.0)
+            gparam["lr"] = lr * (rb["lr_mult"] if o is opt_pi else 1.0) * gparam.get("lr_scale", 1.0)
     step_acc += 1.0 / args.utd
     n = int(step_acc)
     step_acc -= n

@@ -33,3 +33,27 @@ class TerrainSetup:
     spawn_xy: float = 0.5
     curriculum: bool = True
     bounds_margin: float = 1.0
+
+
+# named variants (train.py --terrain_variant; evaluation and the player read it from the checkpoint's args)
+#  v1        exp8: mjlab legacy rewards, mjlab velocity-slot depth noise
+#  stair     + stair swing clearance with lookahead (tracking scandot_stair_cfg), stronger edge (all levels) and
+#            foothold penalties; depth realism: 0-60 ms latency, 5% dropped frames, 20% invalid pixels at depth jumps
+#  stair_mem stair + 10 frames 2 apart (0.6 s of visual memory instead of 0.3 s: the ground within ~0.37 m of the
+#            pelvis is outside the head camera's view, so a riser leaves the image ~0.4 s before the foot reaches it)
+TERRAIN_VARIANTS = ("v1", "stair", "stair_mem")
+
+
+def make_setup(variant: str = "v1", seed: int = 0) -> TerrainSetup:
+    from dataclasses import replace
+
+    st = TerrainSetup(seed=seed)
+    if variant == "v1":
+        return st
+    if variant not in TERRAIN_VARIANTS:
+        raise ValueError(f"unknown terrain variant {variant!r}")
+    st.reward = replace(st.reward, w_swing_clear=-3.0, w_edge=-3.0, edge_level=-1, w_foothold=-2.0)
+    st.camera = replace(st.camera, latency_steps=(0, 3), frame_drop=0.05, edge_dropout=0.2)
+    if variant == "stair_mem":
+        st.camera = replace(st.camera, stride=2)
+    return st

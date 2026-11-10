@@ -79,6 +79,18 @@ class TerrainRewardCfg:
     w_cheat: float = -1.0
     cheat_yaw: float = 0.2
     w_feet_flat: float = -0.4
+    # stair swing clearance with lookahead (mjlab tracking scandot_stair_cfg ``stairs_swing_clearance_cost``): the
+    # lowest sole corner of a moving swing foot must clear the highest ground under the foot footprint and under
+    # the footprint shifted `swing_lookahead` m along the foot's horizontal velocity by `swing_margin` m;
+    # cost per foot = pseudo-Huber(shortfall / margin) * min(speed / swing_speed_scale, 1), swing feet on stair tiles
+    # with a moving command only
+    w_swing_clear: float = 0.0
+    swing_margin: float = 0.05
+    swing_lookahead: float = 0.08
+    foot_half_length: float = 0.105
+    foot_half_width: float = 0.037
+    swing_lateral_margin: float = 0.03
+    swing_speed_scale: float = 0.3
     w_upper: float = 1.5
     upper_std: float = 0.3
     contact_clearance: float = 0.015  # soft contact: sigmoid((contact_clearance - pad clearance) / contact_width)
@@ -107,6 +119,9 @@ class TerrainTask:
         self.scan_grid = torch.cartesian_prod(gx, gy)  # (187, 2)
         fx, fy = torch.linspace(-0.09, 0.09, 7, device=device), torch.tensor([-0.02, 0.02], device=device)
         self.footprint = torch.cartesian_prod(fx, fy)  # (14, 2): mjlab foot_height_scan 0.18 x 0.04 at 0.03
+        self.swing_grid = torch.cartesian_prod(torch.linspace(0, 1, 9, device=device), torch.linspace(0, 1, 3, device=device))  # (27, 2)
+        hl, hw = cfg.foot_half_length, cfg.foot_half_width
+        self.sole_corners = t([[-hl, -hw], [-hl, hw], [hl, -hw], [hl, hw]])  # (4, 2) in the foot frame, at site height
         self.std = {"standing": torch.full((29,), 0.05, device=device),
                     "walking": t(_per_joint(_STD["walking"])), "running": t(_per_joint(_STD["running"]))}  # fmt: skip
         self._mass_model()
@@ -206,6 +221,29 @@ class TerrainTask:
         Iw = bR @ self.inertia @ bR.transpose(-1, -2)
         return L + (Iw @ bw.unsqueeze(-1)).squeeze(-1).sum(-2)
 
+    def swing_clearance(self, site, site_v, Rf):
+        """(clearance (B, 2), horizontal foot speed (B, 2)): lowest sole corner minus the highest ground under the
+        footprint box (plus a lateral margin) stretched `swing_lookahead` m along the foot's horizontal velocity."""
+        c = self.cfg
+        cy, sy = Rf[..., 0, 0], Rf[..., 1, 0]
+        nrm = (cy**2 + sy**2).clamp(min=1e-6).sqrt()
+        cy, sy = cy / nrm, sy / nrm  # foot yaw
+        vx, vy = site_v[..., 0], site_v[..., 1]
+        lx, ly = cy * vx + sy * vy, -sy * vx + cy * vy  # velocity in the foot-yaw frame
+        speed = (lx**2 + ly**2 + 1e-8).sqrt()
+        ax, ay = c.swing_lookahead * lx / speed.clamp(min=1e-3), c.swing_lookahead * ly / speed.clamp(min=1e-3)
+        hl, hw = c.foot_half_length, c.foot_half_width + c.swing_lateral_margin
+        x0, x1 = -hl + ax.clamp(max=0), hl + ax.clamp(min=0)
+        y0, y1 = -hw + ay.clamp(max=0), hw + ay.clamp(min=0)
+        gx = x0[..., None] + (x1 - x0)[..., None] * self.swing_grid[:, 0]  # (B, 2, 27)
+        gy = y0[..., None] + (y1 - y0)[..., None] * self.swing_grid[:, 1]
+        xy = site[..., None, :2] + torch.stack((cy[..., None] * gx - sy[..., None] * gy, sy[..., None] * gx + cy[..., None] * gy), -1)
+        h = self.ground(xy).amax(-1)
+        # sole corners at site height in the foot frame -> world z offsets R[2, :2] @ (x, y)
+        dz = (Rf[..., 2:3, :2] @ self.sole_corners.T).squeeze(-2)  # (B, 2, 4)
+        lowest = site[..., 2] + dz.amin(-1)
+        return lowest - h, speed
+
     # ------------------------------------------------------------------ reward / fall
     def reward(self, S, cmd, a, a_prev, info, terms: bool = False):
         """info: (B, 2) = [stairs flag, terrain level]."""
@@ -243,6 +281,15 @@ class TerrainTask:
         g_feet = -Rf[..., 2, :]  # gravity in each foot frame
         flat = (con * g_feet[..., :2].norm(dim=-1)).sum(-1)
         L = self.angular_momentum(B)
+        swing_clear = torch.zeros_like(stuck)
+        if c.w_swing_clear:
+            sclr, sspeed = self.swing_clearance(site, site_v, Rf)
+            # pseudo-Huber of the relative shortfall instead of mjlab's clamp to 1: quadratic for small deficits,
+            # linear for deep ones, so a toe well below the next tread still gets a lifting gradient
+            short = ((c.swing_margin - sclr) / c.swing_margin).clamp(min=0)
+            moving_cmd = (cmd[:, :2].norm(dim=-1) > 0.1).float() * stairs.float()
+            cost = 2 * ((1 + short**2).sqrt() - 1)
+            swing_clear = (cost * (sspeed / c.swing_speed_scale).clamp(max=1) * (1 - con)).sum(-1) * moving_cmd
         r = (c.w_lin * torch.exp(-e_lin / c.track_std**2) + c.w_yaw * torch.exp(-e_yaw / c.track_std**2)
              + c.w_upright * torch.exp(-(g_torso[:, :2] ** 2).sum(-1) / c.upright_std**2)
              + c.w_upright * torch.exp(-(g_pelvis[:, :2] ** 2).sum(-1) / c.upright_std**2)
@@ -251,13 +298,13 @@ class TerrainTask:
              + c.w_angmom * (L**2).sum(-1) * (cmd[:, 2].abs() < 0.05).float()
              + c.w_joint_limit * mdp.joint_limit(q) + c.w_action_rate * ((a - a_prev) ** 2).sum(-1)
              + c.w_clearance * clearance + c.w_slip * slip + c.w_edge * edge + c.w_foothold * foothold
-             + c.w_stuck * stuck + c.w_cheat * cheat + c.w_feet_flat * flat)  # fmt: skip
+             + c.w_stuck * stuck + c.w_cheat * cheat + c.w_feet_flat * flat + c.w_swing_clear * swing_clear)  # fmt: skip
         if mdp.upper_cmd:
             r = r + c.w_upper * torch.exp(-mdp.upper_err(q, cmd)[0] / c.upper_std**2)
         r = r * CONTROL_DT
         if terms:
             return r, {"e_lin": e_lin, "e_yaw": e_yaw, "contact": con, "foot_h": foot_h, "edge": edge,
-                       "foothold": foothold, "stuck": stuck, "cheat": cheat}  # fmt: skip
+                       "foothold": foothold, "stuck": stuck, "cheat": cheat, "swing_clear": swing_clear}  # fmt: skip
         return r
 
     def height(self, S):

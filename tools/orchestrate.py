@@ -54,7 +54,7 @@ LAFAN = os.path.join(PACKS, "lafan_loco.pt")
 SONIC = os.path.join(PACKS, "sonic_loco_p1.pt")  # --plausible: 68 clips with velocity glitches removed
 ALL = os.path.join(PACKS, "all_g1.pt")  # --plausible: 4.4% of clips with impossible velocities removed
 ALL_RAW = os.path.join(PACKS, "all_g1_raw.pt")  # every clip of motion_data_used_g1 that loads
-STATUS = os.path.join(REPO, "logs", "orchestrator.json")
+STATUS = os.environ.get("SM_STATUS", os.path.join(REPO, "logs", "orchestrator.json"))  # one file per concurrent orchestrator
 
 CRITERIA = {  # best evaluation must satisfy all
     "exp1": {"norm_return": (">=", 0.75), "fail_rate": ("<=", 0.12), "vel_med_err": ("<=", 0.35), "vel_fall_rate": ("<=", 0.10)},
@@ -74,6 +74,8 @@ CRITERIA["exp5_1gpu"], CRITERIA["exp6_1gpu"] = CRITERIA["exp5"], CRITERIA["exp6"
 CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp7_long"] = CRITERIA["exp7_long_1gpu"] = CRITERIA["exp5"]
 # exp8 (terrain + head depth): flat criteria plus half of the terrain traversal trials (all tile types and levels)
 CRITERIA["exp8"] = CRITERIA["exp8_1gpu"] = {**CRITERIA["exp5"], "terrain_success": (">=", 0.5)}  # upper-body tracking is reported, not (yet) a pass criterion
+# exp9a/exp9b (stair foot placement, single GPU each): exp8's criteria
+CRITERIA["exp9a"] = CRITERIA["exp9b"] = CRITERIA["exp8"]
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
 TRAIN_ARGS = ["--pi_gn_skip", "5"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01, "upper_med_err": -0.005,
@@ -328,6 +330,12 @@ if __name__ == "__main__":
             log(f"exp8: 2-GPU run {st['runs']['exp8']['state']}; retrying single-GPU as exp8_1gpu")
             run_experiment("exp8_1gpu", [ALL], loco, per_gpu=False, gpus=[6], eval_gpu=7, extra=extra)
         log("terrain done")
+    elif sys.argv[1:2] == ["stair"]:  # exp9a/exp9b: exp8 + stair rewards and depth realism, one GPU each (train + eval)
+        _, _, name, variant, gpu, init = sys.argv[:6]
+        loco = [SONIC, LAFAN]  # exp8's velocity library (a separate SM_STATUS file does not hold exp3's choice)
+        extra = ["--self_collision", "--upper_cmd", "--terrain", "--terrain_variant", variant, "--dec_lr_mult", "0.25", "--init_from", init]
+        run_experiment(name, [ALL], loco, per_gpu=False, gpus=[int(gpu)], eval_gpu=int(gpu), extra=extra)
+        log(f"{name} done")
     elif sys.argv[1:] == ["upper_long"]:  # exp7 continued from its last.pt to max_iters (no plateau stop)
         loco = [SONIC, LAFAN] if status.get("exp3_loco_choice") == "exp2" else [LAFAN]
         extra = ["--self_collision", "--upper_cmd"]

@@ -86,7 +86,9 @@ if TERRAIN:
     from supermimic.terrain import TILE_TYPES
     from supermimic.terrain_env import TerrainSetup, TerrainSim
 
-    SETUP = TerrainSetup(seed=run_args.get("terrain_seed", 0))
+    from supermimic.terrain_setup import make_setup
+
+    SETUP = make_setup(run_args.get("terrain_variant", "v1"), run_args.get("terrain_seed", 0))
     Sim = lambda n, n_vel=0: TerrainSim(n, motion, mdp, dev, eval_mode=True, n_vel=n_vel, self_collision=SELF_COL, setup=SETUP)  # noqa: E731
 else:
     Sim = lambda n, n_vel=0: TrackingSim(n, motion, mdp, dev, eval_mode=True, n_vel=n_vel, self_collision=SELF_COL)  # noqa: E731
@@ -225,19 +227,46 @@ def eval_terrain(pi: Policy) -> dict:
     fell = torch.zeros(n, dtype=torch.bool, device=dev)
     reached = torch.zeros(n, dtype=torch.bool, device=dev)
     hist = None
+    # foot-terrain quality, counted while a trial is active (before reaching 3.5 m or falling): stumbles (a foot's
+    # contact force mostly horizontal, mjlab MoRE feet_stumble with ratio 1.5, |F| > 20 N), shin hits (knee link
+    # contact > 20 N) and touchdowns whose footprint spans an edge (> edge_threshold of height range, feet_edge)
+    feet = [env.mjm.body(n + "_ankle_roll_link").id for n in ("left", "right")]
+    knees = [env.mjm.body(n + "_knee_link").id for n in ("left", "right")]
+    stumble, shin = torch.zeros(n, device=dev), torch.zeros(n, device=dev)
+    touch, edge_td = torch.zeros(n, device=dev), torch.zeros(n, device=dev)
+    loaded_prev = torch.ones(n, 2, dtype=torch.bool, device=dev)
     for t in range(500):
         S = env.state()
         o = mdp.obs(S, env.a_prev, env.xi)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
         env.step(pi.act_vel(hist, mdp.norm_cmd(env.cmd), env.depth_stack.float()))
         S1 = env.state()
+        active = ~fell & ~reached
+        F = env.body_forces()
+        Ff, Fk = F[:, feet], F[:, knees]
+        st = (Ff[..., :2].norm(dim=-1) > 1.5 * Ff[..., 2].abs()) & (Ff.norm(dim=-1) > 20)
+        stumble += (st.any(-1) & active).float()
+        shin += ((Fk.norm(dim=-1) > 20).any(-1) & active).float()
+        loaded = Ff[..., 2] > 20
+        td = loaded & ~loaded_prev & active[:, None]
+        site = env.task.feet(S1)[0]
+        fp = env.task.footprint_ground(site, S1)
+        on_edge = (fp.max(-1).values - fp.min(-1).values) > env.task.cfg.edge_threshold
+        touch += td.sum(-1).float()
+        edge_td += (td & on_edge).sum(-1).float()
+        loaded_prev = loaded
         fell |= env.task.fall(S1) & ~reached
         reached |= ((S1[0][:, :2] - start).norm(dim=-1) >= 3.5) & ~fell
     ok = (reached & ~fell).float().view(len(T_KINDS), T_LEVELS, T_TRIALS)
     res = {"terrain_success": ok.mean().item()}
+    view = lambda x: x.view(len(T_KINDS), T_LEVELS * T_TRIALS)  # noqa: E731
     for i, k in enumerate(T_KINDS):
-        res[f"terrain_{TILE_TYPES[k]}"] = ok[i].mean().item()
-        res[f"terrain_{TILE_TYPES[k]}_levels"] = [round(x, 2) for x in ok[i].mean(-1).tolist()]
+        name = TILE_TYPES[k]
+        res[f"terrain_{name}"] = ok[i].mean().item()
+        res[f"terrain_{name}_levels"] = [round(x, 2) for x in ok[i].mean(-1).tolist()]
+        res[f"stumble_{name}"] = view(stumble)[i].mean().item()  # stumbling control steps per trial
+        res[f"shin_{name}"] = view(shin)[i].mean().item()  # shin-contact control steps per trial
+        res[f"edge_{name}"] = (view(edge_td)[i].sum() / view(touch)[i].sum().clamp(min=1)).item()  # share of touchdowns
     return res
 
 
@@ -257,6 +286,7 @@ if UPPER_CMD:
     COLS += ["upper_med_err", "vel_med_err_free", "vel_med_err_up", "vel_fall_rate_up"]
 if TERRAIN:
     COLS += ["terrain_success"] + [f"terrain_{TILE_TYPES[k]}" for k in T_KINDS]
+    COLS += [f"{m}_{TILE_TYPES[k]}" for m in ("stumble", "edge", "shin") for k in T_KINDS if "stairs" in TILE_TYPES[k]]
 
 if args.ckpt:
     res = evaluate(torch.load(args.ckpt, map_location=dev))

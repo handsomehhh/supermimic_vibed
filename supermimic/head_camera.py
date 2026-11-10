@@ -27,8 +27,9 @@ import torch.nn.functional as F
 
 from .rotations import axis_angle_to_mat, quat_to_mat
 
-# camera-frame perturbation parameters stored per episode: dx, dy, dz, roll, pitch, yaw, dfov (deg), dcx, dcy (px), phase
-CAM_PARAM_DIM = 10
+# camera-frame perturbation parameters stored per episode: dx, dy, dz, roll, pitch, yaw, dfov (deg), dcx, dcy (px), phase,
+# latency (control steps)
+CAM_PARAM_DIM = 11
 
 
 @dataclass
@@ -53,6 +54,16 @@ class HeadCameraCfg:
     fov_range_deg: float = 1.0
     center_range_px: float = 1.0
     frames: int = 10
+    # the policy sees `frames` arrived frames `stride` frames apart (stride 2: 10 frames spanning 0.6 s at 30 Hz);
+    # the simulator keeps the last ring_len = stride * (frames - 1) + 1 arrived frames
+    stride: int = 1
+    # sensor realism (0 = off): per-episode latency in control steps (a frame taken at step k arrives at k + L),
+    # per-frame drop probability (the frame never arrives), and invalid pixels at depth discontinuities larger
+    # than edge_jump m (stereo shadows / flying pixels) with probability edge_dropout
+    latency_steps: tuple[int, int] = (0, 0)
+    frame_drop: float = 0.0
+    edge_dropout: float = 0.0
+    edge_jump: float = 0.1
     # ray marching: coarse steps of `step` m in image-plane depth from `near`, then bisection
     near: float = 0.05
     step: float = 0.1
@@ -61,10 +72,24 @@ class HeadCameraCfg:
 
 
 def is_tick(k: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
-    """True at control steps (since reset) where a new 30 Hz frame arrives; step 0 always has one."""
+    """True at control steps (since reset) where a new 30 Hz frame is taken; step 0 always has one."""
     k = k.long()
     ph = phase.long()
     return (k == 0) | ((3 * (k + ph)) // 5 != (3 * (k + ph - 1)) // 5)
+
+
+def arrives(k: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+    """True at control steps k (since reset) where a frame arrives: one taken at k - latency (params[:, 10])."""
+    lat = params[:, 10].long()
+    return (k.long() >= lat) & is_tick(k.long() - lat, params[:, 9])
+
+
+def ring_len(cfg: "HeadCameraCfg") -> int:
+    return cfg.stride * (cfg.frames - 1) + 1
+
+
+def max_latency(cfg: "HeadCameraCfg") -> int:
+    return int(cfg.latency_steps[1])
 
 
 def _occluder_spheres(kin_body_names: list[str]) -> tuple[list[int], np.ndarray, np.ndarray]:
@@ -125,6 +150,7 @@ class HeadCamera:
         p[:, 9] = torch.randint(0, 5, (n,), device=dev).float()
         if not noise:
             return p
+        p[:, 10] = torch.randint(c.latency_steps[0], c.latency_steps[1] + 1, (n,), device=dev).float()
         u = lambda lo, hi: torch.empty(n, device=dev).uniform_(lo, hi)  # noqa: E731
         for i in range(3):
             p[:, i] = u(-c.pos_range[i], c.pos_range[i])
@@ -199,9 +225,18 @@ class HeadCamera:
         if c.self_occlusion:
             d = self.occlude(d, origin, dirs, bp, bR)
         d = d.clamp(max=c.max_depth)  # misses and far hits read max range ("max" clipping)
+        edge = None
+        if noise and c.edge_dropout > 0:
+            g = d.view(-1, c.height, c.width)
+            jump = torch.zeros_like(g)
+            jump[:, :, :-1] = (g[:, :, 1:] - g[:, :, :-1]).abs()
+            jump[:, :-1, :] = torch.maximum(jump[:, :-1, :], (g[:, 1:, :] - g[:, :-1, :]).abs())
+            edge = ((jump > c.edge_jump) & (torch.rand_like(g) < c.edge_dropout)).view_as(d)
         if noise:
             d = d + torch.randn_like(d) * (c.noise_std + c.noise_std_per_m * d)
         invalid = d < c.invalid_below
+        if edge is not None:
+            invalid = invalid | edge
         x = (d.clamp(0, c.max_depth) / c.max_depth).masked_fill(invalid, -1.0)
         if noise and c.dropout > 0:
             x = x.masked_fill(torch.rand_like(x) < c.dropout, -1.0)
