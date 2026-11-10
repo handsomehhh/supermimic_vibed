@@ -113,6 +113,12 @@ class TerrainTask:
         self.max_step_reward = (cfg.w_lin + cfg.w_yaw + 2 * cfg.w_upright + cfg.w_pose
                                 + (cfg.w_upper if mdp.upper_cmd else 0.0)) * CONTROL_DT  # fmt: skip
         self.cos_fall = math.cos(math.radians(cfg.fall_tilt_deg))
+        if torch.device(device).type == "cuda":
+            # FK of all bodies + ground lookups are ~5x faster fused; dynamic: batch sizes vary between call sites
+            self.features = torch.compile(self.features, dynamic=True)
+            self.reward = torch.compile(self.reward, dynamic=True)
+            self.critic_features = torch.compile(self.critic_features, dynamic=True)
+            self.soft_fall = torch.compile(self.soft_fall, dynamic=True)
 
     def _mass_model(self):
         """Per kin-body mass, CoM offset and inertia (fixed children such as head_link folded into their parent)."""
