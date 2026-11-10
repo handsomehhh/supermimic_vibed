@@ -238,10 +238,12 @@ class TerrainTask:
         gx = x0[..., None] + (x1 - x0)[..., None] * self.swing_grid[:, 0]  # (B, 2, 27)
         gy = y0[..., None] + (y1 - y0)[..., None] * self.swing_grid[:, 1]
         xy = site[..., None, :2] + torch.stack((cy[..., None] * gx - sy[..., None] * gy, sy[..., None] * gx + cy[..., None] * gy), -1)
-        h = self.ground(xy).amax(-1)
+        # max(...).values, not amax: the inductor-compiled amax backward over these ground samples returns NaN
+        # (tied maxima on flat treads); max's index-based backward is exact
+        h = self.ground(xy).max(-1).values
         # sole corners at site height in the foot frame -> world z offsets R[2, :2] @ (x, y)
         dz = (Rf[..., 2:3, :2] @ self.sole_corners.T).squeeze(-2)  # (B, 2, 4)
-        lowest = site[..., 2] + dz.amin(-1)
+        lowest = site[..., 2] + dz.min(-1).values
         return lowest - h, speed
 
     # ------------------------------------------------------------------ reward / fall
