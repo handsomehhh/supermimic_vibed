@@ -585,7 +585,8 @@ def save_ckpt(it: int):
     os.replace(path + ".tmp", path)
 
 
-TIMING = int(os.environ.get("SM_TIMING", "0"))  # print the mean wall time per phase every log row
+TIMING = int(os.environ.get("SM_TIMING", "0"))
+PROFILE = int(os.environ.get("SM_PROFILE", "0"))  # profile the policy update at iteration wm_only_iters + SM_PROFILE  # print the mean wall time per phase every log row
 t_phase, t_last = {}, [0.0]
 
 
@@ -616,7 +617,18 @@ for it in range(start_it, args.iterations):
     tmark("world_model")
     agg.setdefault("wm", []).append(l), agg.setdefault("wm8", []).append(e8)
     if it >= args.wm_only_iters:
-        for k, v in policy_update().items():
+        if PROFILE and it == args.wm_only_iters + PROFILE and MAIN:
+            from torch.profiler import ProfilerActivity, profile
+
+            torch.cuda.synchronize()
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
+                res = policy_update()
+                torch.cuda.synchronize()
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30, max_name_column_width=70), flush=True)
+            print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20, max_name_column_width=70), flush=True)
+        else:
+            res = policy_update()
+        for k, v in res.items():
             agg.setdefault(k, []).append(v)
         tmark("policy")
     if (it + 1) % args.log_every == 0:
