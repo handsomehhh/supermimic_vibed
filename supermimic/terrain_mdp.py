@@ -91,6 +91,11 @@ class TerrainRewardCfg:
     foot_half_width: float = 0.037
     swing_lateral_margin: float = 0.03
     swing_speed_scale: float = 0.3
+    # only the half of the footprint box ahead of the foot (along its horizontal velocity) plus the lookahead: the
+    # trailing half over the tread being left would otherwise forbid lowering the foot on a descent until the whole
+    # sole is past the edge
+    swing_front_only: bool = False
+    edge_stairs_only: bool = False  # feet_edge on stair tiles only (a sloped footprint spans > 4 cm above ~12 deg)
     w_upper: float = 1.5
     upper_std: float = 0.3
     contact_clearance: float = 0.015  # soft contact: sigmoid((contact_clearance - pad clearance) / contact_width)
@@ -234,6 +239,9 @@ class TerrainTask:
         ax, ay = c.swing_lookahead * lx / speed.clamp(min=1e-3), c.swing_lookahead * ly / speed.clamp(min=1e-3)
         hl, hw = c.foot_half_length, c.foot_half_width + c.swing_lateral_margin
         x0, x1 = -hl + ax.clamp(max=0), hl + ax.clamp(min=0)
+        if c.swing_front_only:
+            ux = lx / speed.clamp(min=1e-3)
+            x0, x1 = x0 + hl * ux.clamp(min=0), x1 - hl * (-ux).clamp(min=0)
         y0, y1 = -hw + ay.clamp(max=0), hw + ay.clamp(min=0)
         gx = x0[..., None] + (x1 - x0)[..., None] * self.swing_grid[:, 0]  # (B, 2, 27)
         gy = y0[..., None] + (y1 - y0)[..., None] * self.swing_grid[:, 1]
@@ -276,6 +284,8 @@ class TerrainTask:
         slip = (con * ((site_v[..., :2] ** 2).sum(-1) + Wf[..., 2] ** 2)).sum(-1) * active
         stairs, level = info[:, 0] > 0.5, info[:, 1]
         edge = (con * ((fp.max(-1).values - fp.min(-1).values) > c.edge_threshold).float()).sum(-1) * (level > c.edge_level).float()
+        if c.edge_stairs_only:
+            edge = edge * stairs.float()
         foothold = (con * ((site[..., 2:3] - fp) > c.foothold_eps).float().mean(-1)).sum(-1) * stairs.float()
         stuck = ((vb[:, 0].abs() < 0.1) & (cmd[:, 0].abs() > 0.1)).float()
         heading = torch.atan2(R[:, 1, 0], R[:, 0, 0])
