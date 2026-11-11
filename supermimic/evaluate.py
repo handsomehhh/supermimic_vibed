@@ -259,11 +259,18 @@ def eval_terrain(pi: Policy) -> dict:
         reached |= ((S1[0][:, :2] - start).norm(dim=-1) >= 3.5) & ~fell
     ok = (reached & ~fell).float().view(len(T_KINDS), T_LEVELS, T_TRIALS)
     res = {"terrain_success": ok.mean().item()}
+    # failures split into falls and trials that stayed up but did not reach 3.5 m in 10 s (too slow / stuck)
+    slow = (~fell & ~reached).float()
+    dist = (env.qpos[:, :2] - start).norm(dim=-1)
     view = lambda x: x.view(len(T_KINDS), T_LEVELS * T_TRIALS)  # noqa: E731
     for i, k in enumerate(T_KINDS):
         name = TILE_TYPES[k]
         res[f"terrain_{name}"] = ok[i].mean().item()
         res[f"terrain_{name}_levels"] = [round(x, 2) for x in ok[i].mean(-1).tolist()]
+        res[f"fall_{name}"] = view(fell.float())[i].mean().item()
+        res[f"slow_{name}"] = view(slow)[i].mean().item()
+        res[f"fall_{name}_levels"] = [round(x, 2) for x in view(fell.float())[i].view(T_LEVELS, T_TRIALS).mean(-1).tolist()]
+        res[f"dist_slow_{name}"] = (view(dist * slow)[i].sum() / view(slow)[i].sum().clamp(min=1)).item()
         res[f"stumble_{name}"] = view(stumble)[i].mean().item()  # stumbling control steps per trial
         res[f"shin_{name}"] = view(shin)[i].mean().item()  # shin-contact control steps per trial
         res[f"edge_{name}"] = (view(edge_td)[i].sum() / view(touch)[i].sum().clamp(min=1)).item()  # share of touchdowns
@@ -287,6 +294,7 @@ if UPPER_CMD:
 if TERRAIN:
     COLS += ["terrain_success"] + [f"terrain_{TILE_TYPES[k]}" for k in T_KINDS]
     COLS += [f"{m}_{TILE_TYPES[k]}" for m in ("stumble", "edge", "shin") for k in T_KINDS if "stairs" in TILE_TYPES[k]]
+    COLS += [f"{m}_{TILE_TYPES[k]}" for m in ("fall", "slow") for k in T_KINDS if "down" in TILE_TYPES[k]]
 
 if args.ckpt:
     res = evaluate(torch.load(args.ckpt, map_location=dev))
