@@ -42,6 +42,7 @@ parser.add_argument("--max_clips", type=int, default=1024)
 parser.add_argument("--max_loco_clips", type=int, default=512)
 parser.add_argument("--trials", type=int, default=4)
 parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--terms", action="store_true", help="--ckpt only: weighted terrain reward terms per tile, split by outcome")
 args = parser.parse_args()
 
 import torch
@@ -51,7 +52,7 @@ from supermimic.env import TrackingSim, use_warp_stream
 from supermimic.env import CMD_HI, CMD_LO
 from supermimic.kinematics import G1Kinematics
 from supermimic.mdp import MAX_STEP_REWARD, MDP, OBS_DIM, REL_DIM, UPPER, UPPER_GROUPS
-from supermimic.motion import MotionLib
+from supermimic.motion import CONTROL_DT, MotionLib
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
 
@@ -235,13 +236,27 @@ def eval_terrain(pi: Policy) -> dict:
     stumble, shin = torch.zeros(n, device=dev), torch.zeros(n, device=dev)
     touch, edge_td = torch.zeros(n, device=dev), torch.zeros(n, device=dev)
     loaded_prev = torch.ones(n, 2, dtype=torch.bool, device=dev)
+    c = env.task.cfg
+    TW = {"edge": c.w_edge, "foothold": c.w_foothold, "swing_clear": c.w_swing_clear, "stuck": c.w_stuck, "cheat": c.w_cheat}
+    tsum = {k: torch.zeros(n, device=dev) for k in (*TW, "reward", "lin_track")}
+    nact = torch.zeros(n, device=dev)
     for t in range(500):
         S = env.state()
         o = mdp.obs(S, env.a_prev, env.xi)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        env.step(pi.act_vel(hist, mdp.norm_cmd(env.cmd), env.depth_stack.float()))
+        a_prev = env.a_prev.clone()
+        a = pi.act_vel(hist, mdp.norm_cmd(env.cmd), env.depth_stack.float())
+        env.step(a)
         S1 = env.state()
         active = ~fell & ~reached
+        if args.terms:
+            r, terms = env.task.reward(S1, env.cmd, a, a_prev, env.info, terms=True)
+            af = active.float()
+            nact += af
+            tsum["reward"] += r / CONTROL_DT * af
+            tsum["lin_track"] += c.w_lin * torch.exp(-terms["e_lin"] / c.track_std**2) * af
+            for k, w in TW.items():
+                tsum[k] += w * terms[k] * af
         F = env.body_forces()
         Ff, Fk = F[:, feet], F[:, knees]
         st = (Ff[..., :2].norm(dim=-1) > 1.5 * Ff[..., 2].abs()) & (Ff.norm(dim=-1) > 20)
@@ -271,6 +286,11 @@ def eval_terrain(pi: Policy) -> dict:
         res[f"slow_{name}"] = view(slow)[i].mean().item()
         res[f"fall_{name}_levels"] = [round(x, 2) for x in view(fell.float())[i].view(T_LEVELS, T_TRIALS).mean(-1).tolist()]
         res[f"dist_slow_{name}"] = (view(dist * slow)[i].sum() / view(slow)[i].sum().clamp(min=1)).item()
+        if args.terms:  # mean weighted term per active control step (unscaled by dt), trials that reached vs stayed
+            for grp, m in (("reached", view(reached.float())[i]), ("slow", view(slow)[i])):
+                if m.sum() > 0:
+                    res[f"terms_{name}_{grp}"] = {k: round((view(v)[i] * m).sum().item() / (view(nact)[i] * m).sum().clamp(min=1).item(), 4)
+                                                  for k, v in tsum.items()}
         res[f"stumble_{name}"] = view(stumble)[i].mean().item()  # stumbling control steps per trial
         res[f"shin_{name}"] = view(shin)[i].mean().item()  # shin-contact control steps per trial
         res[f"edge_{name}"] = (view(edge_td)[i].sum() / view(touch)[i].sum().clamp(min=1)).item()  # share of touchdowns
