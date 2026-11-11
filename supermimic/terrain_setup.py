@@ -45,7 +45,12 @@ class TerrainSetup:
 #            onto any slope or step costly; exp9a stood still ~1 m into 60% of stairs-down and 50% of slope-down
 #            trials, without a single fall), default foothold weight, swing clearance on the leading half of the foot
 #  realism   exp10b (control): v1 rewards + stair's depth realism only
-TERRAIN_VARIANTS = ("v1", "stair", "stair_mem", "stair2", "realism")
+#  shin      exp10c: realism + a light shin clearance term only. exp10a stopped at the stair top in 20-35% of the
+#            down trials although stopping scores lower in the true reward (6.99 vs 7.89 per step): the swing
+#            clearance cost rises as the foot crosses the edge, a barrier on the only path down that the analytic
+#            gradients of the imagined rollouts do not get over; the shin term is zero until a shin point is within
+#            3 cm of the step below it
+TERRAIN_VARIANTS = ("v1", "stair", "stair_mem", "stair2", "realism", "shin")
 
 
 def make_setup(variant: str = "v1", seed: int = 0) -> TerrainSetup:
@@ -58,6 +63,9 @@ def make_setup(variant: str = "v1", seed: int = 0) -> TerrainSetup:
         raise ValueError(f"unknown terrain variant {variant!r}")
     st.camera = replace(st.camera, latency_steps=(0, 3), frame_drop=0.05, edge_dropout=0.2)
     if variant == "realism":
+        return st
+    if variant == "shin":
+        st.reward = replace(st.reward, w_shin_clear=-0.5)
         return st
     if variant == "stair2":
         st.reward = replace(st.reward, w_swing_clear=-3.0, swing_front_only=True, w_edge=-1.0, edge_level=-1, edge_stairs_only=True)

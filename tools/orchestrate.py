@@ -75,7 +75,7 @@ CRITERIA["exp7"] = CRITERIA["exp7_1gpu"] = CRITERIA["exp7_long"] = CRITERIA["exp
 # exp8 (terrain + head depth): flat criteria plus half of the terrain traversal trials (all tile types and levels)
 CRITERIA["exp8"] = CRITERIA["exp8_1gpu"] = {**CRITERIA["exp5"], "terrain_success": (">=", 0.5)}  # upper-body tracking is reported, not (yet) a pass criterion
 # exp9a/exp9b (stair foot placement, single GPU each): exp8's criteria
-CRITERIA["exp9a"] = CRITERIA["exp9b"] = CRITERIA["exp10a"] = CRITERIA["exp10b"] = CRITERIA["exp8"]
+CRITERIA["exp9a"] = CRITERIA["exp9b"] = CRITERIA["exp10a"] = CRITERIA["exp10b"] = CRITERIA["exp10c"] = CRITERIA["exp8"]
 # stabilizer for the BPTT policy update (the in-trainer rollback is on by default)
 TRAIN_ARGS = ["--pi_gn_skip", "5"]
 IMPROVE = {"norm_return": +0.005, "fail_rate": -0.01, "vel_med_err": -0.01, "vel_fall_rate": -0.01, "upper_med_err": -0.005,

@@ -95,6 +95,13 @@ class TerrainRewardCfg:
     # trailing half over the tread being left would otherwise forbid lowering the foot on a descent until the whole
     # sole is past the edge
     swing_front_only: bool = False
+    # shin clearance (stair tiles, moving command): points along each knee->ankle segment (excluding the ankle end)
+    # must stay `shin_margin` m above the ground below them after a `shin_radius` capsule; the heightfield makes a
+    # point that has entered a step (riser on the way up, the edge behind on the way down) a negative clearance;
+    # cost = pseudo-Huber(shortfall / margin) summed over points and legs
+    w_shin_clear: float = 0.0
+    shin_margin: float = 0.03
+    shin_radius: float = 0.05
     edge_stairs_only: bool = False  # feet_edge on stair tiles only (a sloped footprint spans > 4 cm above ~12 deg)
     w_upper: float = 1.5
     upper_std: float = 0.3
@@ -116,6 +123,8 @@ class TerrainTask:
         names = kin.body_names
         self.pelvis, self.torso = names.index("pelvis"), names.index("torso_link")
         self.foot_ids = [names.index("left_ankle_roll_link"), names.index("right_ankle_roll_link")]
+        self.knee_ids = [names.index("left_knee_link"), names.index("right_knee_link")]
+        self.ankle_ids = [names.index("left_ankle_pitch_link"), names.index("right_ankle_pitch_link")]
         t = lambda x: torch.tensor(x, dtype=torch.float32, device=device)  # noqa: E731
         self.foot_site = t(FOOT_SITE)
         self.pads = t(PADS)
@@ -302,6 +311,15 @@ class TerrainTask:
             moving_cmd = (cmd[:, :2].norm(dim=-1) > 0.1).float() * stairs.float()
             cost = 2 * ((1 + short**2).sqrt() - 1)
             swing_clear = (cost * (sspeed / c.swing_speed_scale).clamp(max=1) * (1 - con)).sum(-1) * moving_cmd
+        shin_clear = torch.zeros_like(stuck)
+        if c.w_shin_clear:
+            pk, pa = bp[:, self.knee_ids], bp[:, self.ankle_ids]  # (B, 2, 3)
+            tt = torch.tensor([0.0, 0.25, 0.5, 0.75], device=pk.device)
+            pts = pk[:, :, None] + (pa - pk)[:, :, None] * tt[:, None]  # (B, 2, 4, 3)
+            scl = pts[..., 2] - self.ground(pts[..., :2]) - c.shin_radius
+            sshort = ((c.shin_margin - scl) / c.shin_margin).clamp(min=0)
+            moving = (cmd[:, :2].norm(dim=-1) > 0.1).float() * stairs.float()
+            shin_clear = (2 * ((1 + sshort**2).sqrt() - 1)).sum((-1, -2)) * moving
         r = (c.w_lin * torch.exp(-e_lin / c.track_std**2) + c.w_yaw * torch.exp(-e_yaw / c.track_std**2)
              + c.w_upright * torch.exp(-(g_torso[:, :2] ** 2).sum(-1) / c.upright_std**2)
              + c.w_upright * torch.exp(-(g_pelvis[:, :2] ** 2).sum(-1) / c.upright_std**2)
@@ -310,13 +328,13 @@ class TerrainTask:
              + c.w_angmom * (L**2).sum(-1) * (cmd[:, 2].abs() < 0.05).float()
              + c.w_joint_limit * mdp.joint_limit(q) + c.w_action_rate * ((a - a_prev) ** 2).sum(-1)
              + c.w_clearance * clearance + c.w_slip * slip + c.w_edge * edge + c.w_foothold * foothold
-             + c.w_stuck * stuck + c.w_cheat * cheat + c.w_feet_flat * flat + c.w_swing_clear * swing_clear)  # fmt: skip
+             + c.w_stuck * stuck + c.w_cheat * cheat + c.w_feet_flat * flat + c.w_swing_clear * swing_clear + c.w_shin_clear * shin_clear)  # fmt: skip
         if mdp.upper_cmd:
             r = r + c.w_upper * torch.exp(-mdp.upper_err(q, cmd)[0] / c.upper_std**2)
         r = r * CONTROL_DT
         if terms:
             return r, {"e_lin": e_lin, "e_yaw": e_yaw, "contact": con, "foot_h": foot_h, "edge": edge,
-                       "foothold": foothold, "stuck": stuck, "cheat": cheat, "swing_clear": swing_clear}  # fmt: skip
+                       "foothold": foothold, "stuck": stuck, "cheat": cheat, "swing_clear": swing_clear, "shin_clear": shin_clear}  # fmt: skip
         return r
 
     def height(self, S):
