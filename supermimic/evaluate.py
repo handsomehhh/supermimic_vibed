@@ -326,6 +326,10 @@ while True:
               + (" | terrain " + ", ".join(f"{TILE_TYPES[k]} {res[f'terrain_{TILE_TYPES[k]}']:.2f}" for k in T_KINDS) if TERRAIN else "")
               + f" ({time.time() - t0:.0f}s)", flush=True)  # fmt: skip
         done.add(it)
+        if args.watch:
+            # one checkpoint per process: the simulators kept across evaluations drifted (exp8 ckpt 16000 and exp9a
+            # ckpt 24000 scored 0.89/4-5% motion failures in the watcher, 0.93/0.5% evaluated alone), so start over
+            os.execv(sys.executable, [sys.executable] + sys.argv)
     if not args.watch:
         break
     time.sleep(60)
